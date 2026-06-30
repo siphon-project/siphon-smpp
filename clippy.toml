@@ -1,0 +1,7 @@
+# Clippy configuration for siphon-smpp.
+#
+# too-many-arguments-threshold: SMPP PDU constructors and the smpp34 client/
+# server builders carry many protocol fields, so the default threshold of 7
+# fires on the natural shape of the protocol. Raise it to 12 (matching the
+# siphon workspace) so the lint still flags genuinely-egregious signatures.
+too-many-arguments-threshold = 12

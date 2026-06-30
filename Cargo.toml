@@ -1,0 +1,35 @@
+[package]
+name = "siphon-smpp"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "SMPP 3.4 addon for siphon — exposes a scriptable `smpp` namespace to Python"
+authors = ["SIPhon Contributors"]
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/siphon-project/siphon-smpp"
+homepage = "https://github.com/siphon-project/siphon"
+keywords = ["smpp", "sms", "siphon", "smsc", "telecom"]
+categories = ["network-programming"]
+
+# siphon extension: plugs into a siphon binary via
+# `register_namespace_with("smpp", siphon_smpp::namespace(cfg))` +
+# `register_task(siphon_smpp::task(cfg))`. Scripts handle SMPP PDUs
+# (submit_sm, deliver_sm, …) through the `siphon.smpp` namespace.
+
+[features]
+default = []
+
+[dependencies]
+smpp34 = "1.0" # pure-Rust SMPP 3.4 codec + async client/server (crates.io)
+siphon-sip = { git = "https://github.com/siphon-project/siphon", rev = "e78936cfaefb506d2a18c8141fb89312e05fc62a" }
+# pyo3 must track siphon-sip's pin (currently 0.29): both link the `python`
+# native library, and Cargo refuses two versions of a `links` crate in one graph.
+pyo3 = { version = "0.29", features = ["auto-initialize"] }
+pyo3-async-runtimes = { version = "0.29", features = ["tokio-runtime"] }
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+tracing = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_yaml = "0.9"
+thiserror = "2"

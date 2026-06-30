@@ -1,0 +1,42 @@
+# .github/workflows/ci.yaml — siphon-smpp CI
+#
+# siphon-smpp embeds CPython via PyO3 (auto-initialize), so the build needs a
+# Python interpreter present. Otherwise it's a normal Rust library: format +
+# lint + test on stable. Clippy runs with `-D warnings` (matching the siphon
+# workspace); the lint policy lives in `clippy.toml`.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Format
+        run: cargo fmt --all -- --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Test
+        run: cargo test --all-features
