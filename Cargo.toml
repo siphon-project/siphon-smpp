@@ -22,7 +22,11 @@ default = []
 
 [dependencies]
 smpp34 = "1.0" # pure-Rust SMPP 3.4 codec + async client/server (crates.io)
-siphon-sip = { git = "https://github.com/siphon-project/siphon", rev = "e78936cfaefb506d2a18c8141fb89312e05fc62a" }
+# Canonical repo URL after the siphon → siphon-sip rename. The URL string must
+# match byte-for-byte across every crate that depends on siphon-sip in one build
+# graph (e.g. siphon-bin), or cargo resolves two separate copies. branch=main
+# tracks the latest lib; the consumer's Cargo.lock still pins a concrete SHA.
+siphon-sip = { git = "https://github.com/siphon-project/siphon-sip", branch = "main" }
 # pyo3 must track siphon-sip's pin (currently 0.29): both link the `python`
 # native library, and Cargo refuses two versions of a `links` crate in one graph.
 pyo3 = { version = "0.29", features = ["auto-initialize"] }
