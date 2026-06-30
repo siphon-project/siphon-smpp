@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [0.1.0] — 2026-06-30
+## [1.0.0] — 2026-06-30
 
 First open-source release — an SMPP 3.4 addon for
 [siphon](https://github.com/siphon-project/siphon-sip) with enough surface to build
