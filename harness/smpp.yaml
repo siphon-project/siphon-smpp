@@ -1,0 +1,12 @@
+# siphon-smpp addon config for the load test (the echo path).
+#
+# Referenced from your siphon.yaml as `extensions.smpp: harness/smpp.yaml`.
+# Just the inbound listener — echo.py only acks submit_sm, so no outbound
+# binds are needed.
+
+server:
+  bind_address: "0.0.0.0"
+  port: 2775
+  enquire_link_timer_ms: 30000
+  inactivity_timer_ms: 300000
+  response_timer_ms: 30000

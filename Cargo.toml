@@ -13,7 +13,7 @@ keywords = ["smpp", "sms", "siphon", "smsc", "telecom"]
 categories = ["network-programming"]
 # Operator-facing assets (deployment templates, Python examples) aren't
 # part of the published crate.
-exclude = ["deploy/", "examples/*.py"]
+exclude = ["deploy/", "examples/*.py", "harness/"]
 
 # siphon extension: a composing siphon binary registers the `namespace`
 # and `task` hooks at startup. Scripts then handle SMPP PDUs (submit_sm,
