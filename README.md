@@ -155,10 +155,11 @@ Key points:
   `ESME_ROK` ack. Unknown status strings raise immediately.
 - **`@smpp.on_session("bound" | "unbound")`** fires for both inbound ESME and
   outbound bind lifecycle; the handler receives a `Session`.
-- **Send helpers** (all `await`) return an `SmppResp` (`command_status`,
-  `message_id`, `ok`):
-  - outbound, by bind name: `submit_via`, `data_via`, `cancel_via`
-    (+ `query_via` / `replace_via`, forward-compat stubs);
+- **Send helpers** (all `await`): most return an `SmppResp` (`command_status`,
+  `message_id`, `ok`); `query_via` returns a `QueryResp` (`message_state`,
+  `final_date`, `error_code`).
+  - outbound, by bind name: `submit_via`, `data_via`, `cancel_via`, `query_via`,
+    `replace_via`;
   - inbound, by `session_id`: `deliver_to`, `data_to`, `alert_to`.
 - **Config readouts**: `smpp.config()`, `smpp.bind_address()`, `smpp.binds()`,
   `smpp.routing_rules()`.
@@ -170,9 +171,9 @@ Key points:
 
 ## SMPP operation coverage
 
-`✅ full` · `🟡 partial` (wired, but some fields await an upstream `smpp34`
-accessor) · `⏳ stub` (hook exists + documented, raises / not dispatched until
-`smpp34` adds support — scripts written against it light up automatically).
+`✅ full` · `⏳ stub` (hook present + documented; not yet dispatched because the
+underlying `smpp34` PDU is a stub — scripts written against it light up when it
+lands). Built on `smpp34` 1.2.
 
 ### Inbound — an ESME binds to us (server)
 
@@ -182,10 +183,12 @@ accessor) · `⏳ stub` (hook exists + documented, raises / not dispatched until
 | `bind_transmitter` / `bind_receiver` | — | reject `ESME_RINVSYSID` (transceiver only) | ✅ |
 | `submit_sm` | `@smpp.on_pdu("submit_sm")` | `ESME_ROK` ack | ✅ |
 | `data_sm` | `@smpp.on_pdu("data_sm")` | reject `ESME_RSYSERR` | ✅ |
-| `cancel_sm` | `@smpp.on_pdu("cancel_sm")` | reject `ESME_RCANCELFAIL` | 🟡¹ |
+| `cancel_sm` | `@smpp.on_pdu("cancel_sm")` | reject `ESME_RCANCELFAIL` | ✅ |
+| `query_sm` | `@smpp.on_pdu("query_sm")` → `pdu.reply_query(...)` | reject `ESME_RQUERYFAIL` | ✅ |
+| `replace_sm` | `@smpp.on_pdu("replace_sm")` | reject `ESME_RREPLACEFAIL` | ✅ |
 | `enquire_link` | runtime (keep-alive) | auto-ack | ✅ |
 | `unbind` | runtime + `@smpp.on_session("unbound")` | accept | ✅ |
-| `query_sm` / `replace_sm` / `submit_sm_multi` | — | — | ⏳² |
+| `submit_sm_multi` | — | — | ⏳¹ |
 
 ### Outbound — we bind to a remote SMSC (client)
 
@@ -193,7 +196,7 @@ accessor) · `⏳ stub` (hook exists + documented, raises / not dispatched until
 |---|---|---|---|
 | `deliver_sm` (incl. **DLR**) | `@smpp.on_pdu("deliver_sm")` | `ESME_ROK` ack | ✅ |
 | `data_sm` | `@smpp.on_pdu("data_sm")` | reject `ESME_RSYSERR` | ✅ |
-| `alert_notification` | `@smpp.on_pdu("alert_notification")` | no-op | 🟡¹ |
+| `alert_notification` | `@smpp.on_pdu("alert_notification")` | no-op | ✅ |
 
 ### Send helpers
 
@@ -202,17 +205,15 @@ accessor) · `⏳ stub` (hook exists + documented, raises / not dispatched until
 | `submit_via` | → outbound bind | `smpp34` `SMSC::submit_sm` | ✅ |
 | `data_via` | → outbound bind | `SMSC::send_data_sm` | ✅ |
 | `cancel_via` | → outbound bind | `SMSC::send_cancel_sm` | ✅ |
-| `query_via` / `replace_via` | → outbound bind | — | ⏳² |
+| `query_via` | → outbound bind | `SMSC::send_query_sm` | ✅ |
+| `replace_via` | → outbound bind | `SMSC::send_replace_sm` | ✅ |
 | `deliver_to` | → bound ESME (`session_id`) | `ESME::send_deliver_sm` | ✅ |
 | `data_to` | → bound ESME | `ESME::send_data_sm` | ✅ |
 | `alert_to` | → bound ESME | `ESME::send_alert_notification` | ✅ |
 
-¹ **partial** — the handler is dispatched, but `smpp34` 1.1.x doesn't expose the
-`cancel_sm` / `alert_notification` address/id fields, so they arrive empty. The
-hook fires and policy (accept/reject, trigger) works today; fields populate once
-`smpp34` adds accessors. ² **stub** — no corresponding `smpp34` send/listener
-yet; the hook/helper is present and documented (`query_via`/`replace_via` raise
-`NotImplementedError`) so scripts are forward-compatible.
+¹ **stub** — `submit_sm_multi` (one submit to many destinations) is a stub PDU in
+`smpp34`; siphon-smpp exposes nothing for it yet. Most gateways fan out
+`submit_sm` per destination. It lights up when `smpp34` implements the PDU.
 
 ---
 

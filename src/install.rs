@@ -21,7 +21,7 @@ use pyo3::types::{PyDict, PyList, PyModule};
 use crate::pyclasses::{AlertNotification, Bind, BindResult, Pdu, PduReply, Session};
 use crate::sends::{
     alert_to, cancel_via, data_to, data_via, deliver_to, query_via, replace_via, submit_via,
-    SmppResp,
+    QueryResp, SmppResp,
 };
 use crate::SmppConfig;
 
@@ -59,6 +59,7 @@ pub fn namespace(
         module.add_class::<BindResult>()?;
         module.add_class::<AlertNotification>()?;
         module.add_class::<SmppResp>()?;
+        module.add_class::<QueryResp>()?;
 
         // ── Send helpers ──────────────────────────────────────────
         // These need the runtime state (set by the task); each is

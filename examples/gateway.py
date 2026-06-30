@@ -245,11 +245,13 @@ async def _route_mo_reply(pdu, session):
 
 @smpp.on_pdu("alert_notification")
 async def on_alert(alert, session):
-    # An upstream SMSC signalling that a previously-unavailable MS is now
-    # reachable. The cue to flush any MT you queued for it. (smpp34 1.1.x
-    # doesn't surface the alert addressing yet — see the README coverage
-    # matrix — so this fires as a trigger for now.)
-    log.info(f"alert_notification on {session.system_id}: flush queued MT")
+    # An upstream SMSC signalling that a previously-unavailable MS
+    # (alert.source_addr) is now reachable. The cue to flush any MT you
+    # queued for it.
+    log.info(
+        f"alert_notification on {session.system_id}: "
+        f"{alert.source_addr} available — flush queued MT"
+    )
 
 
 # ── cancel_sm from an inbound ESME ──────────────────────────────────────

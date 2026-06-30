@@ -7,57 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-### Added — "build a full SMSC" surface
+## [0.1.0] — 2026-06-30
 
-- **Bind reject reasons**: `bind.reject(status, reason)` returns a `BindResult`
-  the runtime maps onto the wire `bind_*_resp` status and logs the reason;
-  `bind.accept()` unchanged. Bare truthy/falsy returns still work.
-- **Delivery receipts reach scripts**: `deliver_sm` is no longer swallowed when
-  it's a DLR — every `deliver_sm` dispatches to `@smpp.on_pdu("deliver_sm")`.
-  New `Pdu.is_dlr` and `Pdu.receipt` (best-effort parse of the receipt body to
-  `{id, sub, dlvrd, submit_date, done_date, stat, err, text, raw}`).
-- **SMSC→ESME sends**, targeting a bound ESME by `session_id`: `deliver_to`,
-  `data_to`, `alert_to`. Lets a script MT-deliver and route DLRs back to the
-  originating ESME.
-- **More outbound sends**: `data_via`, `cancel_via` (+ `query_via` /
-  `replace_via` forward-compat stubs that raise `NotImplementedError` until
-  `smpp34` exposes the send).
-- **More inbound dispatch**: `data_sm` (both directions), `cancel_sm`, and
-  `alert_notification` (outbound) now dispatch to `@smpp.on_pdu(...)`.
-- **Session lifecycle**: `@smpp.on_session("bound" | "unbound")` fires for both
-  inbound ESME and outbound bind lifecycle. Inbound `Session.system_id` is now
-  populated.
-- **Outbound throttling**: per-bind `max_msg_per_sec` is enforced with a token
-  bucket that paces (not rejects) `submit_via` / `data_via`.
-- **Pyclasses**: `BindResult`, `AlertNotification`; `SubmitResp` → `SmppResp`
-  (now the response type for all send helpers, with `.ok`).
-- **Benches + leak check**: `benches/codec.rs` (criterion) over the per-PDU hot
-  paths; `examples/leak_check.rs` + `scripts/mem_leak_test.sh` assert flat live
-  bytes. Both gated in CI.
-- **Deployment templates**: `deploy/` — Dockerfile, docker-compose, and
-  Kubernetes HA/failover manifests with a documented failover model.
-- **Examples**: `examples/gateway.py` (a commodity store-and-forward SMS gateway
-  with DLR correlation) and `examples/echo.py`.
-- **Public API**: `Pdu` and `Receipt` (+ `Pdu::from_submit/from_deliver/
-  from_data`, `Receipt::parse`) re-exported for codec-adjacent reuse.
+First open-source release — an SMPP 3.4 addon for
+[siphon](https://github.com/siphon-project/siphon) with enough surface to build
+a full store-and-forward SMSC in scripts. Built on
+[`smpp34`](https://github.com/Real-Time-Telecom-B-V/smpp34) 1.2.
 
-### Changed
+### Composition
 
-- `smpp34` dependency floor bumped to `1.1` (alert/data/cancel send helpers).
+- `namespace(cfg)` + `task(cfg)` hooks that plug an `smpp` Python namespace and a
+  tokio SMPP runtime into a composing siphon binary.
+- YAML + `SMPP_BIND_<NAME>_*` env-var configuration (`SmppConfig`), with
+  `${VAR}` / `${VAR:-default}` expansion and declarative routing rules.
 
-## [0.1.0]
+### Binds & authentication
 
-Initial open-source release — an SMPP 3.4 addon for the
-[siphon](https://github.com/siphon-project/siphon) scripting platform.
+- SMPP **server** for inbound binds (transceiver only; TX/RX rejected), with
+  script-driven `@smpp.on_bind` authorisation. `bind.reject(status, reason)`
+  returns a `BindResult` mapped onto the wire status and logged; closed by
+  default (no handler → reject).
+- **Outbound binds** to remote SMSCs/aggregators, each supervised with
+  reconnect + exponential backoff and an optional per-bind `max_msg_per_sec`
+  token-bucket throttle.
+- `@smpp.on_session("bound" | "unbound")` lifecycle for both inbound ESME and
+  outbound bind; inbound `Session` carries `system_id`.
 
-### Added
+### Operation coverage (full unless noted)
 
-- `namespace(cfg)` + `task(cfg)` builder hooks that plug an `smpp` Python
-  namespace and a tokio SMPP runtime into a siphon binary.
-- SMPP server for **inbound binds** (transceiver only; TX/RX rejected) with
-  script-driven `@smpp.on_bind` authentication and `@smpp.on_pdu("submit_sm")`
-  dispatch.
-- **Outbound binds** to remote SMSCs/aggregators with reconnect + exponential
-  backoff; `submit_via(bind="…")` from scripts; `@smpp.on_pdu("deliver_sm")`.
-- YAML + `SMPP_BIND_<NAME>_*` env-var configuration ([`SmppConfig`]).
-- Script-facing pyclasses: `Pdu`, `PduReply`, `Session`, `Bind`.
+- **Inbound dispatch** to `@smpp.on_pdu(...)`: `submit_sm`, `data_sm`,
+  `cancel_sm`, `query_sm` (reply via `pdu.reply_query(...)`), `replace_sm`.
+  `submit_sm_multi` is not yet exposed (stub PDU in `smpp34`).
+- **Outbound dispatch**: `deliver_sm` (incl. **delivery receipts** — `Pdu.is_dlr`
+  + parsed `Pdu.receipt`), `data_sm`, `alert_notification`.
+- **Outbound send helpers** (target a bind): `submit_via`, `data_via`,
+  `cancel_via`, `query_via` (→ `QueryResp`), `replace_via`.
+- **Inbound send helpers** (target a bound ESME by `session_id`): `deliver_to`,
+  `data_to`, `alert_to` — MT-deliver and route DLRs back to the originating ESME.
+- Pyclasses: `Pdu`, `PduReply`, `Session`, `Bind`, `BindResult`,
+  `AlertNotification`, `SmppResp`, `QueryResp`. `Pdu` + `Receipt` (and
+  `Pdu::from_*` / `Receipt::parse`) are re-exported for codec-adjacent reuse.
+
+### Quality & ops
+
+- Criterion benches (`benches/codec.rs`) over the per-PDU hot paths; a
+  counting-allocator leak check (`examples/leak_check.rs` +
+  `scripts/mem_leak_test.sh`) asserting flat live bytes. Both gated in CI.
+- Deployment templates (`deploy/`): Dockerfile, docker-compose, and Kubernetes
+  HA/failover manifests with a documented failover model.
+- Examples: `examples/gateway.py` (a commodity store-and-forward SMS gateway with
+  DLR correlation) and `examples/echo.py`.

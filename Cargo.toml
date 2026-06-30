@@ -25,7 +25,7 @@ default = []
 [dependencies]
 # SMPP 3.4 wire codec + async client/server: smpp34, provided by
 # Real Time Telecom B.V. — https://github.com/Real-Time-Telecom-B-V/smpp34
-smpp34 = "1.1"
+smpp34 = "1.2"
 # Canonical repo URL after the siphon → siphon-sip rename. The URL string must
 # match byte-for-byte across every crate that depends on siphon-sip in one build
 # graph (e.g. siphon-bin), or cargo resolves two separate copies. branch=main

@@ -31,7 +31,8 @@ use smpp34::{
     alert_notification, bind_receiver, bind_receiver_resp, bind_transceiver, bind_transceiver_resp,
     bind_transmitter, bind_transmitter_resp, cancel_sm, cancel_sm_resp,
     client::{SmppClient, SmppClientListener, BIND_TYPE, SMSC},
-    data_sm, data_sm_resp, deliver_sm, deliver_sm_resp,
+    data_sm, data_sm_resp, deliver_sm, deliver_sm_resp, query_sm, query_sm_resp, replace_sm,
+    replace_sm_resp,
     server::ESME,
     submit_sm, submit_sm_resp, SmppConnectionInformation, SmppError, SmppServer,
     SmppServerListener,
@@ -391,10 +392,7 @@ impl SmppServerListener for State {
         conn: &SmppConnectionInformation,
         session_id: &String,
     ) -> cancel_sm_resp {
-        // smpp34 1.1.x doesn't expose cancel_sm fields; the script gets a
-        // command-only Pdu and decides policy (accept/reject). Fields
-        // light up once smpp34 adds accessors.
-        let pdu = Pdu::cancel_stub();
+        let pdu = Pdu::from_cancel(&request);
         let session = self.esme_session(session_id, conn).await;
         match dispatch_pdu_opt(&self.script, "cancel_sm", pdu, session).await {
             None => request.reject(SmppError::ESME_RCANCELFAIL),
@@ -404,6 +402,51 @@ impl SmppServerListener for State {
                 tracing::error!(target: "siphon_smpp",
                     error=%e, "@smpp.on_pdu(cancel_sm) raised");
                 request.reject(SmppError::ESME_RCANCELFAIL)
+            }
+        }
+    }
+
+    async fn on_query_sm(
+        &self,
+        request: query_sm,
+        conn: &SmppConnectionInformation,
+        session_id: &String,
+    ) -> query_sm_resp {
+        let pdu = Pdu::from_query(&request);
+        let session = self.esme_session(session_id, conn).await;
+        match dispatch_pdu_opt(&self.script, "query_sm", pdu, session).await {
+            None => request.reject(SmppError::ESME_RQUERYFAIL),
+            Some(Ok(reply)) if reply.command_status == SmppError::ESME_ROK => request.accept(
+                reply.message_id.unwrap_or_default(),
+                reply.final_date,
+                reply.message_state.unwrap_or(0),
+                reply.error_code,
+            ),
+            Some(Ok(reply)) => request.reject(reply.command_status),
+            Some(Err(e)) => {
+                tracing::error!(target: "siphon_smpp",
+                    error=%e, "@smpp.on_pdu(query_sm) raised");
+                request.reject(SmppError::ESME_RQUERYFAIL)
+            }
+        }
+    }
+
+    async fn on_replace_sm(
+        &self,
+        request: replace_sm,
+        conn: &SmppConnectionInformation,
+        session_id: &String,
+    ) -> replace_sm_resp {
+        let pdu = Pdu::from_replace(&request);
+        let session = self.esme_session(session_id, conn).await;
+        match dispatch_pdu_opt(&self.script, "replace_sm", pdu, session).await {
+            None => request.reject(SmppError::ESME_RREPLACEFAIL),
+            Some(Ok(reply)) if reply.command_status == SmppError::ESME_ROK => request.accept(),
+            Some(Ok(reply)) => request.reject(reply.command_status),
+            Some(Err(e)) => {
+                tracing::error!(target: "siphon_smpp",
+                    error=%e, "@smpp.on_pdu(replace_sm) raised");
+                request.reject(SmppError::ESME_RREPLACEFAIL)
             }
         }
     }
@@ -535,14 +578,13 @@ impl SmppClientListener for BindListener {
 
     async fn on_alert_notification(
         &self,
-        _request: alert_notification,
+        request: alert_notification,
         conn: &SmppConnectionInformation,
         session_id: &String,
     ) {
-        // smpp34 1.1.x doesn't expose alert_notification fields; the hook
-        // fires so scripts can react (e.g. flush queued MT), with the
-        // addressing populated once smpp34 adds accessors.
-        let alert = AlertNotification::default();
+        // Notification only (no wire response): dispatch so the script can
+        // react, e.g. flush queued MT for the now-available MS.
+        let alert = AlertNotification::from_alert(&request);
         let session = self.bind_session(session_id, conn);
         if let Err(e) = dispatch_alert(&self.state.script, alert, session).await {
             tracing::error!(target: "siphon_smpp",

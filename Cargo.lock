@@ -3076,7 +3076,7 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 [[package]]
 name = "siphon-sip"
 version = "1.0.0"
-source = "git+https://github.com/siphon-project/siphon?rev=e78936cfaefb506d2a18c8141fb89312e05fc62a#e78936cfaefb506d2a18c8141fb89312e05fc62a"
+source = "git+https://github.com/siphon-project/siphon-sip?branch=main#c23c0d64d7a0c2878b11ca8d06059e48465fcaf4"
 dependencies = [
  "aes",
  "arc-swap",
@@ -3161,9 +3161,9 @@ checksum = "8ed6a63f02c8539c91a8685a86f4099661ba3da017932f6ebbea6de3f0fa7c90"
 
 [[package]]
 name = "smpp34"
-version = "1.1.1"
+version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c1681fb1d5dc842d3603cd6d5f58b51e6e6b60c051ef2a5b5e0f70978f31a3f9"
+checksum = "76c8235d507333b55e847f37a59f8c3685a597852aee366b086d7e326b528f39"
 dependencies = [
  "async-trait",
  "bytes",

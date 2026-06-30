@@ -10,19 +10,28 @@ use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 
-use smpp34::{deliver_sm, submit_sm, SmppError};
+use smpp34::{
+    alert_notification, cancel_sm, deliver_sm, query_sm, replace_sm, submit_sm, SmppError,
+};
 
 // ── Pdu ─────────────────────────────────────────────────────────────────
 
-/// Common surface for `submit_sm`, `deliver_sm`, `data_sm` and
-/// `cancel_sm`. Field names mirror SMPP 3.4 §5.2; same shape on every
-/// direction so the routing layer can treat them uniformly. The
-/// `command` field tells you which op produced it.
+/// Common surface for `submit_sm`, `deliver_sm`, `data_sm`, `cancel_sm`,
+/// `query_sm` and `replace_sm`. Field names mirror SMPP 3.4 §5.2; same
+/// shape on every direction so the routing layer can treat them
+/// uniformly. The `command` field tells you which op produced it; not
+/// every field is meaningful for every command (e.g. `message_id` is set
+/// only for cancel/query/replace).
 #[pyclass(module = "siphon.smpp", name = "Pdu", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct Pdu {
     #[pyo3(get)]
     pub command: String,
+    /// SMSC-assigned message id — set for `cancel_sm` / `query_sm` /
+    /// `replace_sm` (which target a prior submission); empty for
+    /// `submit_sm` / `deliver_sm` / `data_sm`.
+    #[pyo3(get)]
+    pub message_id: String,
     #[pyo3(get)]
     pub service_type: String,
     #[pyo3(get)]
@@ -109,7 +118,34 @@ impl Pdu {
         Ok(PduReply {
             command_status: cs,
             message_id,
+            message_state: None,
+            final_date: String::new(),
+            error_code: 0,
         })
+    }
+
+    /// Build a successful `query_sm_resp` reply. `message_state` is the
+    /// SMPP message-state code (1=ENROUTE, 2=DELIVERED, 3=EXPIRED,
+    /// 4=DELETED, 5=UNDELIVERABLE, 6=ACCEPTED, 7=UNKNOWN, 8=REJECTED).
+    /// `final_date` is the SMPP-format absolute time (or empty if not
+    /// final), `error_code` the network error code. To reject a query,
+    /// use `pdu.reply(command_status="ESME_RQUERYFAIL")` instead.
+    #[pyo3(signature = (*, message_state, message_id = None, final_date = String::new(), error_code = 0))]
+    fn reply_query(
+        &self,
+        message_state: u8,
+        message_id: Option<String>,
+        final_date: String,
+        error_code: u8,
+    ) -> PduReply {
+        PduReply {
+            command_status: SmppError::ESME_ROK,
+            // default the echoed id to the queried message_id
+            message_id: message_id.or_else(|| Some(self.message_id.clone())),
+            message_state: Some(message_state),
+            final_date,
+            error_code,
+        }
     }
 
     fn __repr__(&self) -> String {
@@ -125,6 +161,7 @@ impl Pdu {
     pub fn from_submit(s: &submit_sm) -> Self {
         Self {
             command: "submit_sm".into(),
+            message_id: String::new(),
             service_type: s.service_type.clone(),
             source_addr_ton: s.source_addr_ton,
             source_addr_npi: s.source_addr_npi,
@@ -145,6 +182,7 @@ impl Pdu {
     pub fn from_deliver(d: &deliver_sm) -> Self {
         Self {
             command: "deliver_sm".into(),
+            message_id: String::new(),
             service_type: d.service_type.clone(),
             source_addr_ton: d.source_addr_ton,
             source_addr_npi: d.source_addr_npi,
@@ -169,6 +207,7 @@ impl Pdu {
     pub fn from_data(d: &smpp34::data_sm) -> Self {
         Self {
             command: "data_sm".into(),
+            message_id: String::new(),
             service_type: d.service_type.clone(),
             source_addr_ton: d.source_addr_ton,
             source_addr_npi: d.source_addr_npi,
@@ -186,19 +225,40 @@ impl Pdu {
         }
     }
 
-    /// Build a `Pdu` describing an inbound `cancel_sm`. smpp34 1.1.x
-    /// keeps the `cancel_sm` fields private (no accessors), so the
-    /// addressing + `message_id` cannot be surfaced yet — only the fact
-    /// that a cancel arrived. The script can still apply policy
-    /// (accept/reject); the fields light up once smpp34 exposes them.
-    /// See the operation-coverage matrix in the README.
-    pub(crate) fn cancel_stub() -> Self {
+    /// Build a `Pdu` from an inbound `cancel_sm` — `message_id` +
+    /// addressing identify the message(s) to cancel.
+    pub fn from_cancel(c: &cancel_sm) -> Self {
         Self {
             command: "cancel_sm".into(),
+            message_id: c.message_id.clone(),
+            service_type: c.service_type.clone(),
+            source_addr_ton: c.source_addr_ton,
+            source_addr_npi: c.source_addr_npi,
+            source_addr: c.source_addr.clone(),
+            dest_addr_ton: c.dest_addr_ton,
+            dest_addr_npi: c.dest_addr_npi,
+            destination_addr: c.destination_addr.clone(),
+            esm_class: 0,
+            protocol_id: 0,
+            priority_flag: 0,
+            registered_delivery: 0,
+            data_coding: 0,
+            sm_length: 0,
+            short_message: Vec::new(),
+        }
+    }
+
+    /// Build a `Pdu` from an inbound `query_sm` — `message_id` + source
+    /// address identify the message whose state is being queried. Reply
+    /// with [`reply_query`](Self::reply_query).
+    pub fn from_query(q: &query_sm) -> Self {
+        Self {
+            command: "query_sm".into(),
+            message_id: q.message_id.clone(),
             service_type: String::new(),
-            source_addr_ton: 0,
-            source_addr_npi: 0,
-            source_addr: String::new(),
+            source_addr_ton: q.source_addr_ton,
+            source_addr_npi: q.source_addr_npi,
+            source_addr: q.source_addr.clone(),
             dest_addr_ton: 0,
             dest_addr_npi: 0,
             destination_addr: String::new(),
@@ -209,6 +269,31 @@ impl Pdu {
             data_coding: 0,
             sm_length: 0,
             short_message: Vec::new(),
+        }
+    }
+
+    /// Build a `Pdu` from an inbound `replace_sm` — `message_id` + source
+    /// address identify the message to replace; `short_message` is the new
+    /// body. (`schedule_delivery_time` / `validity_period` are carried on
+    /// the wire but not surfaced on `Pdu`.)
+    pub fn from_replace(r: &replace_sm) -> Self {
+        Self {
+            command: "replace_sm".into(),
+            message_id: r.message_id.clone(),
+            service_type: String::new(),
+            source_addr_ton: r.source_addr_ton,
+            source_addr_npi: r.source_addr_npi,
+            source_addr: r.source_addr.clone(),
+            dest_addr_ton: 0,
+            dest_addr_npi: 0,
+            destination_addr: String::new(),
+            esm_class: 0,
+            protocol_id: 0,
+            priority_flag: 0,
+            registered_delivery: r.registered_delivery,
+            data_coding: 0,
+            sm_length: r.sm_length,
+            short_message: r.short_message.clone(),
         }
     }
 }
@@ -334,6 +419,10 @@ impl Receipt {
 pub struct PduReply {
     pub command_status: SmppError,
     pub message_id: Option<String>,
+    /// query_sm path only — set by [`Pdu::reply_query`].
+    pub message_state: Option<u8>,
+    pub final_date: String,
+    pub error_code: u8,
 }
 
 #[pymethods]
@@ -344,6 +433,9 @@ impl PduReply {
         Ok(Self {
             command_status: parse_smpp_status(&command_status)?,
             message_id,
+            message_state: None,
+            final_date: String::new(),
+            error_code: 0,
         })
     }
 
@@ -360,6 +452,9 @@ impl PduReply {
         Self {
             command_status: SmppError::ESME_ROK,
             message_id: None,
+            message_state: None,
+            final_date: String::new(),
+            error_code: 0,
         }
     }
 }
@@ -448,13 +543,10 @@ impl BindResult {
 
 /// Payload for `@smpp.on_pdu("alert_notification")` — an SMSC telling us
 /// (on an outbound bind) that a previously-unavailable MS is now
-/// reachable, so queued MT can be flushed.
-///
-/// NOTE: smpp34 1.1.x does not expose the `alert_notification` PDU
-/// fields, so `source_addr` / `esme_addr` / `ms_availability_status`
-/// arrive empty for now — the hook fires so the capability is wired, and
-/// the fields populate once smpp34 surfaces accessors. See the
-/// operation-coverage matrix in the README.
+/// reachable, so queued MT can be flushed. `source_addr` is the MS,
+/// `esme_addr` the ESME the alert is destined for, and
+/// `ms_availability_status` the availability state (0=available,
+/// 1=denied, 2=unavailable) when present.
 #[pyclass(
     module = "siphon.smpp",
     name = "AlertNotification",
@@ -468,6 +560,16 @@ pub struct AlertNotification {
     pub esme_addr: String,
     #[pyo3(get)]
     pub ms_availability_status: Option<u8>,
+}
+
+impl AlertNotification {
+    pub fn from_alert(a: &alert_notification) -> Self {
+        Self {
+            source_addr: a.source_addr.clone(),
+            esme_addr: a.esme_addr.clone(),
+            ms_availability_status: a.ms_availability_status,
+        }
+    }
 }
 
 #[pymethods]
@@ -599,6 +701,7 @@ mod tests {
     fn make_pdu(esm_class: u8) -> Pdu {
         Pdu {
             command: "submit_sm".into(),
+            message_id: String::new(),
             service_type: String::new(),
             source_addr_ton: 1,
             source_addr_npi: 1,
@@ -704,6 +807,34 @@ mod tests {
             let rej = pdu.reply("ESME_RINVDSTADR".to_string(), None).unwrap();
             assert_eq!(rej.command_status, SmppError::ESME_RINVDSTADR);
         });
+    }
+
+    #[test]
+    fn pdu_reply_query_builds_query_reply() {
+        Python::attach(|_py| {
+            let mut pdu = make_pdu(0x00);
+            pdu.command = "query_sm".into();
+            pdu.message_id = "msg-42".into();
+            // message_state required; message_id defaults to the queried id.
+            let r = pdu.reply_query(2, None, "2401011200".to_string(), 0);
+            assert_eq!(r.command_status, SmppError::ESME_ROK);
+            assert_eq!(r.message_state, Some(2));
+            assert_eq!(r.message_id.as_deref(), Some("msg-42"));
+            assert_eq!(r.final_date, "2401011200");
+            // explicit message_id override
+            let r2 = pdu.reply_query(7, Some("other".to_string()), String::new(), 9);
+            assert_eq!(r2.message_id.as_deref(), Some("other"));
+            assert_eq!(r2.error_code, 9);
+        });
+    }
+
+    #[test]
+    fn pdu_from_query_maps_fields() {
+        let q = smpp34::query_sm::new(1, "qid-7".to_string(), 1, 1, "15550101".to_string());
+        let pdu = Pdu::from_query(&q);
+        assert_eq!(pdu.command, "query_sm");
+        assert_eq!(pdu.message_id, "qid-7");
+        assert_eq!(pdu.source_addr, "15550101");
     }
 
     #[test]

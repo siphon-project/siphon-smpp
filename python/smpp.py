@@ -27,8 +27,8 @@ Send helpers (all async — `await` them):
     * submit_via(bind=…, source_addr=…, destination_addr=…, short_message=…, **fields)
     * data_via(bind=…, source_addr=…, destination_addr=…, **fields)
     * cancel_via(bind=…, message_id=…, **fields)
-    * query_via / replace_via — forward-compat stubs (raise
-      NotImplementedError until smpp34 exposes the send).
+    * query_via(bind=…, message_id=…, **fields) -> QueryResp
+    * replace_via(bind=…, message_id=…, short_message=…, **fields)
   Inbound, target a bound ESME by session_id:
     * deliver_to(session_id=…, source_addr=…, destination_addr=…, short_message=…, **fields)
     * data_to(session_id=…, source_addr=…, destination_addr=…, **fields)
@@ -36,8 +36,8 @@ Send helpers (all async — `await` them):
 All are attached as Rust pyfunctions at namespace-init time.
 
 Pyclasses (`Pdu`, `PduReply`, `Session`, `Bind`, `BindResult`,
-`AlertNotification`, `SmppResp`) are attached to the module by Rust;
-they're listed at the bottom for IDE / docs.
+`AlertNotification`, `SmppResp`, `QueryResp`) are attached to the module
+by Rust; they're listed at the bottom for IDE / docs.
 """
 
 import asyncio
@@ -83,6 +83,11 @@ def on_pdu(command):
       * "deliver_sm"         — MT / MO / **DLR** from an outbound bind
       * "data_sm"            — TLV-based message, either direction
       * "cancel_sm"          — cancel request from an inbound ESME
+                               (pdu.message_id + addressing)
+      * "query_sm"           — message-state query from an inbound ESME
+                               (reply with pdu.reply_query(...))
+      * "replace_sm"         — replace request from an inbound ESME
+                               (pdu.message_id + new pdu.short_message)
       * "alert_notification" — MS-available alert from an outbound bind
 
     Handler signature: `(pdu, session)` (for "alert_notification" the
@@ -90,6 +95,8 @@ def on_pdu(command):
       * `pdu.reply(message_id="…")` — accept (submit_sm path)
       * `pdu.reply(command_status="ESME_RSUBMITFAIL")` — reject
       * `pdu.reply()` — accept with default ESME_ROK (deliver_sm path)
+      * `pdu.reply_query(message_state=2, final_date="…", error_code=0)`
+        — query_sm success (message_state 1=ENROUTE … 8=REJECTED)
       * `None` — same as bare `pdu.reply()`
 
     For "deliver_sm", check `pdu.is_dlr`; if set, `pdu.receipt` is the
@@ -157,16 +164,19 @@ def routing_rules():
 # These names are populated by siphon_smpp::namespace() before the
 # script runs:
 #
-#   Pdu               — passed into @on_pdu handlers; fields + .reply()
-#                        + .is_dlr / .receipt (deliver_sm)
-#   PduReply          — what .reply() returns (you usually don't
-#                        construct these directly)
+#   Pdu               — passed into @on_pdu handlers; fields + .message_id
+#                        + .reply() / .reply_query() + .is_dlr / .receipt
+#   PduReply          — what .reply() / .reply_query() return (you usually
+#                        don't construct these directly)
 #   Session           — passed into @on_pdu / @on_session;
 #                        .kind / .session_id / .system_id / .client_addr
 #   Bind              — passed into @on_bind;
 #                        .system_id / .password / .client_addr
 #                        + .accept() / .reject(status, reason)
 #   BindResult        — what bind.accept()/reject() return
-#   AlertNotification — passed into @on_pdu("alert_notification")
-#   SmppResp          — return value from the send helpers
+#   AlertNotification — passed into @on_pdu("alert_notification");
+#                        .source_addr / .esme_addr / .ms_availability_status
+#   SmppResp          — return value from most send helpers
 #                        (.command_status / .message_id / .ok)
+#   QueryResp         — return value from query_via
+#                        (.message_state / .final_date / .error_code / .ok)

@@ -13,7 +13,7 @@
 //! awaiting** so one slow peer can't block another, then awaits the
 //! response and returns a typed [`SmppResp`].
 
-use pyo3::exceptions::{PyKeyError, PyNotImplementedError, PyRuntimeError};
+use pyo3::exceptions::{PyKeyError, PyRuntimeError};
 use pyo3::prelude::*;
 
 use smpp34::client::SMSC;
@@ -58,6 +58,42 @@ impl SmppResp {
             command_status: "ESME_ROK".to_string(),
             message_id,
         }
+    }
+}
+
+/// Response returned by [`query_via`] — the result of a `query_sm`.
+///
+/// `message_state` is the SMPP message-state code (1=ENROUTE, 2=DELIVERED,
+/// 3=EXPIRED, 4=DELETED, 5=UNDELIVERABLE, 6=ACCEPTED, 7=UNKNOWN,
+/// 8=REJECTED). `final_date` is the SMPP-format absolute time (empty if
+/// not final); `error_code` the network error code.
+#[pyclass(module = "siphon.smpp", name = "QueryResp", skip_from_py_object)]
+#[derive(Debug, Clone)]
+pub struct QueryResp {
+    #[pyo3(get)]
+    pub command_status: String,
+    #[pyo3(get)]
+    pub message_id: String,
+    #[pyo3(get)]
+    pub message_state: u8,
+    #[pyo3(get)]
+    pub final_date: String,
+    #[pyo3(get)]
+    pub error_code: u8,
+}
+
+#[pymethods]
+impl QueryResp {
+    #[getter]
+    fn ok(&self) -> bool {
+        self.command_status == "ESME_ROK"
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "QueryResp(command_status={:?}, message_id={:?}, message_state={}, final_date={:?}, error_code={})",
+            self.command_status, self.message_id, self.message_state, self.final_date, self.error_code
+        )
     }
 }
 
@@ -295,10 +331,11 @@ pub fn cancel_via<'py>(
     })
 }
 
-/// `query_sm` via an outbound bind — **stub**. smpp34 1.1.x has no
-/// `SMSC::send_query_sm`, so this raises `NotImplementedError`. The hook
-/// exists so scripts can be written against the final surface; it lights
-/// up once smpp34 exposes the send. See the operation-coverage matrix.
+/// Query the state of a previously-submitted message via the named
+/// outbound bind. Resolves to a [`QueryResp`] carrying `message_state`
+/// (1=ENROUTE … 8=REJECTED), `final_date` and `error_code`.
+///
+/// NOTE: requires a TX-capable bind (transmitter / transceiver).
 #[pyfunction]
 #[pyo3(signature = (*, bind, message_id, source_addr = String::new(),
                     source_addr_ton = 1, source_addr_npi = 1))]
@@ -310,24 +347,31 @@ pub fn query_via<'py>(
     source_addr_ton: u8,
     source_addr_npi: u8,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let _ = (
-        bind,
-        message_id,
-        source_addr,
-        source_addr_ton,
-        source_addr_npi,
-    );
+    let state = require_state()?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        Err::<(), _>(PyNotImplementedError::new_err(
-            "query_via: smpp34 1.1.x does not expose SMSC::send_query_sm yet \
-             (tracked for a future smpp34 release)",
-        ))
+        let (smsc, _) = bind_handle(&state, &bind).await?;
+        let resp = smsc
+            .send_query_sm(message_id, source_addr_ton, source_addr_npi, source_addr)
+            .await;
+        match resp {
+            Ok(r) => Ok(QueryResp {
+                command_status: "ESME_ROK".to_string(),
+                message_id: r.message_id,
+                message_state: r.message_state,
+                final_date: r.final_date,
+                error_code: r.error_code,
+            }),
+            Err(e) => Err(PyRuntimeError::new_err(format!(
+                "bind {bind:?} query_sm failed: {e:?}"
+            ))),
+        }
     })
 }
 
-/// `replace_sm` via an outbound bind — **stub**. smpp34 1.1.x has no
-/// `SMSC::send_replace_sm`. Same forward-compat contract as
-/// [`query_via`].
+/// Replace a previously-submitted message via the named outbound bind.
+/// Pass the SMSC-assigned `message_id` and the new `short_message`.
+///
+/// NOTE: requires a TX-capable bind (transmitter / transceiver).
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
 #[pyo3(signature = (*, bind, message_id, source_addr = String::new(),
@@ -349,23 +393,28 @@ pub fn replace_via<'py>(
     sm_default_msg_id: u8,
     short_message: Vec<u8>,
 ) -> PyResult<Bound<'py, PyAny>> {
-    let _ = (
-        bind,
-        message_id,
-        source_addr,
-        source_addr_ton,
-        source_addr_npi,
-        schedule_delivery_time,
-        validity_period,
-        registered_delivery,
-        sm_default_msg_id,
-        short_message,
-    );
+    let state = require_state()?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        Err::<(), _>(PyNotImplementedError::new_err(
-            "replace_via: smpp34 1.1.x does not expose SMSC::send_replace_sm yet \
-             (tracked for a future smpp34 release)",
-        ))
+        let (smsc, _) = bind_handle(&state, &bind).await?;
+        let resp = smsc
+            .send_replace_sm(
+                message_id,
+                source_addr_ton,
+                source_addr_npi,
+                source_addr,
+                schedule_delivery_time,
+                validity_period,
+                registered_delivery,
+                sm_default_msg_id,
+                short_message,
+            )
+            .await;
+        match resp {
+            Ok(_) => Ok(SmppResp::ok_with(String::new())),
+            Err(e) => Err(PyRuntimeError::new_err(format!(
+                "bind {bind:?} replace_sm failed: {e:?}"
+            ))),
+        }
     })
 }
 
