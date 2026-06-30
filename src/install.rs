@@ -20,8 +20,8 @@ use pyo3::types::{PyDict, PyList, PyModule};
 
 use crate::pyclasses::{AlertNotification, Bind, BindResult, Pdu, PduReply, Session};
 use crate::sends::{
-    alert_to, cancel_via, data_to, data_via, deliver_to, query_via, replace_via, submit_via,
-    QueryResp, SmppResp,
+    alert_to, cancel_via, data_to, data_via, deliver_to, query_via, replace_via, submit_multi_via,
+    submit_via, QueryResp, SmppResp,
 };
 use crate::SmppConfig;
 
@@ -70,6 +70,7 @@ pub fn namespace(
         //   * inbound, target a bound ESME by session_id: deliver_to /
         //     data_to / alert_to
         module.add_function(wrap_pyfunction!(submit_via, &module)?)?;
+        module.add_function(wrap_pyfunction!(submit_multi_via, &module)?)?;
         module.add_function(wrap_pyfunction!(data_via, &module)?)?;
         module.add_function(wrap_pyfunction!(cancel_via, &module)?)?;
         module.add_function(wrap_pyfunction!(query_via, &module)?)?;

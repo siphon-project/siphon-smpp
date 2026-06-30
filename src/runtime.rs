@@ -34,8 +34,8 @@ use smpp34::{
     data_sm, data_sm_resp, deliver_sm, deliver_sm_resp, query_sm, query_sm_resp, replace_sm,
     replace_sm_resp,
     server::ESME,
-    submit_sm, submit_sm_resp, SmppConnectionInformation, SmppError, SmppServer,
-    SmppServerListener,
+    submit_sm, submit_sm_multi, submit_sm_multi_resp, submit_sm_resp, SmppConnectionInformation,
+    SmppError, SmppServer, SmppServerListener,
 };
 use tokio::sync::Mutex;
 
@@ -447,6 +447,31 @@ impl SmppServerListener for State {
                 tracing::error!(target: "siphon_smpp",
                     error=%e, "@smpp.on_pdu(replace_sm) raised");
                 request.reject(SmppError::ESME_RREPLACEFAIL)
+            }
+        }
+    }
+
+    async fn on_submit_sm_multi(
+        &self,
+        request: submit_sm_multi,
+        conn: &SmppConnectionInformation,
+        session_id: &String,
+    ) -> submit_sm_multi_resp {
+        let pdu = Pdu::from_submit_multi(&request);
+        let session = self.esme_session(session_id, conn).await;
+        match dispatch_pdu_opt(&self.script, "submit_sm_multi", pdu, session).await {
+            // Opt-in, like submit_sm's data-path siblings: no handler → reject.
+            None => request.reject(SmppError::ESME_RSYSERR),
+            // accept(message_id, unsuccess_sme); we don't surface per-dest
+            // unsuccess yet — an all-or-nothing accept covers the common case.
+            Some(Ok(reply)) if reply.command_status == SmppError::ESME_ROK => {
+                request.accept(reply.message_id.unwrap_or_default(), Vec::new())
+            }
+            Some(Ok(reply)) => request.reject(reply.command_status),
+            Some(Err(e)) => {
+                tracing::error!(target: "siphon_smpp",
+                    error=%e, "@smpp.on_pdu(submit_sm_multi) raised");
+                request.reject(SmppError::ESME_RSYSERR)
             }
         }
     }
