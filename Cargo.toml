@@ -11,17 +11,21 @@ repository = "https://github.com/siphon-project/siphon-smpp"
 homepage = "https://github.com/siphon-project/siphon"
 keywords = ["smpp", "sms", "siphon", "smsc", "telecom"]
 categories = ["network-programming"]
+# Operator-facing assets (deployment templates, Python examples) aren't
+# part of the published crate.
+exclude = ["deploy/", "examples/*.py"]
 
-# siphon extension: plugs into a siphon binary via
-# `register_namespace_with("smpp", siphon_smpp::namespace(cfg))` +
-# `register_task(siphon_smpp::task(cfg))`. Scripts handle SMPP PDUs
-# (submit_sm, deliver_sm, …) through the `siphon.smpp` namespace.
+# siphon extension: a composing siphon binary registers the `namespace`
+# and `task` hooks at startup. Scripts then handle SMPP PDUs (submit_sm,
+# deliver_sm, …) through the `siphon.smpp` namespace.
 
 [features]
 default = []
 
 [dependencies]
-smpp34 = "1.0" # pure-Rust SMPP 3.4 codec + async client/server (crates.io)
+# SMPP 3.4 wire codec + async client/server: smpp34, provided by
+# Real Time Telecom B.V. — https://github.com/Real-Time-Telecom-B-V/smpp34
+smpp34 = "1.1"
 # Canonical repo URL after the siphon → siphon-sip rename. The URL string must
 # match byte-for-byte across every crate that depends on siphon-sip in one build
 # graph (e.g. siphon-bin), or cargo resolves two separate copies. branch=main
@@ -37,3 +41,13 @@ tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
 thiserror = "2"
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "codec"
+harness = false
+
+[package.metadata.docs.rs]
+all-features = true

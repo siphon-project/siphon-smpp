@@ -1,0 +1,26 @@
+# Front the SMSC replicas with a TCP load balancer.
+#
+# SMPP is a long-lived TCP session, so the LB just needs to pick a healthy
+# replica at bind time and keep the connection pinned to it. Most cloud
+# L4 LBs do this. If yours pools/rebalances mid-connection, disable that
+# for this Service.
+apiVersion: v1
+kind: Service
+metadata:
+  name: smsc
+  labels:
+    app: smsc
+  annotations:
+    # Long timeout: SMPP binds stay open for hours/days. Tune to your LB.
+    # (example for AWS NLB; use your provider's equivalent)
+    service.beta.kubernetes.io/aws-load-balancer-type: "nlb"
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local   # preserve client IP for allow-listing
+  selector:
+    app: smsc
+  ports:
+    - name: smpp
+      port: 2775
+      targetPort: smpp
+      protocol: TCP

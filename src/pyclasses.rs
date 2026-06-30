@@ -3,20 +3,21 @@
 //! The runtime constructs these from inbound PDUs and passes them into
 //! the script via `ScriptHandle::call_handler`. Scripts read fields,
 //! call `pdu.reply(...)` to produce a [`PduReply`], call
-//! `bind.accept()` / `bind.reject()` (or simply return truthy) to
-//! authorise a bind.
+//! `bind.accept()` / `bind.reject("ESME_RINVPASWD", "bad password")`
+//! to authorise a bind (with an explicit reason).
 
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
-use pyo3::types::PyBytes;
+use pyo3::types::{PyBytes, PyDict};
 
 use smpp34::{deliver_sm, submit_sm, SmppError};
 
 // ── Pdu ─────────────────────────────────────────────────────────────────
 
-/// Common surface for `submit_sm` and `deliver_sm`. Field names mirror
-/// SMPP 3.4 §5.2; same shape on both directions so the routing layer
-/// can treat them uniformly.
+/// Common surface for `submit_sm`, `deliver_sm`, `data_sm` and
+/// `cancel_sm`. Field names mirror SMPP 3.4 §5.2; same shape on every
+/// direction so the routing layer can treat them uniformly. The
+/// `command` field tells you which op produced it.
 #[pyclass(module = "siphon.smpp", name = "Pdu", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct Pdu {
@@ -68,6 +69,37 @@ impl Pdu {
         self.esm_class & 0x40 != 0
     }
 
+    /// True when this `deliver_sm` is a **delivery receipt** (DLR) — the
+    /// `esm_class` message-type bits (0x04) flag it as an SMSC delivery
+    /// receipt. Route these back to the ESME that originally requested
+    /// `registered_delivery`. See [`receipt`](Self::receipt) for the
+    /// parsed fields.
+    #[getter]
+    fn is_dlr(&self) -> bool {
+        self.esm_class & 0x04 != 0
+    }
+
+    /// Parsed delivery-receipt fields, or `None` when this PDU is not a
+    /// DLR / the body doesn't follow the de-facto receipt format.
+    ///
+    /// Returns a dict with the keys that were present:
+    /// `id`, `sub`, `dlvrd`, `submit_date`, `done_date`, `stat`, `err`,
+    /// `text`, plus `raw` (the undecoded receipt body). The format is
+    /// not standardised across SMSCs, so this is best-effort — always
+    /// keep `raw` as the source of truth.
+    #[getter]
+    fn receipt<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyDict>> {
+        if !self.is_dlr() {
+            return None;
+        }
+        let parsed = Receipt::parse(&self.short_message)?;
+        let d = PyDict::new(py);
+        // set_item on a fresh dict can't fail in practice; ignore the
+        // Result to keep the getter infallible.
+        let _ = parsed.fill_dict(&d);
+        Some(d)
+    }
+
     /// Build a reply for the dispatcher. Default is `ESME_ROK` with no
     /// message_id; pass `command_status="ESME_RSUBMITFAIL"` etc. to
     /// reject. Pass `message_id="…"` on success (submit_sm path).
@@ -90,7 +122,7 @@ impl Pdu {
 }
 
 impl Pdu {
-    pub(crate) fn from_submit(s: &submit_sm) -> Self {
+    pub fn from_submit(s: &submit_sm) -> Self {
         Self {
             command: "submit_sm".into(),
             service_type: s.service_type.clone(),
@@ -110,7 +142,7 @@ impl Pdu {
         }
     }
 
-    pub(crate) fn from_deliver(d: &deliver_sm) -> Self {
+    pub fn from_deliver(d: &deliver_sm) -> Self {
         Self {
             command: "deliver_sm".into(),
             service_type: d.service_type.clone(),
@@ -128,6 +160,167 @@ impl Pdu {
             sm_length: d.sm_length,
             short_message: d.short_message.clone(),
         }
+    }
+
+    /// Build a `Pdu` from a `data_sm`. `data_sm` carries its payload in
+    /// the `message_payload` TLV rather than `short_message`, so the
+    /// body is empty here; the addressing + coding fields are the useful
+    /// surface for routing.
+    pub fn from_data(d: &smpp34::data_sm) -> Self {
+        Self {
+            command: "data_sm".into(),
+            service_type: d.service_type.clone(),
+            source_addr_ton: d.source_addr_ton,
+            source_addr_npi: d.source_addr_npi,
+            source_addr: d.source_addr.clone(),
+            dest_addr_ton: d.dest_addr_ton,
+            dest_addr_npi: d.dest_addr_npi,
+            destination_addr: d.destination_addr.clone(),
+            esm_class: d.esm_class,
+            protocol_id: 0,
+            priority_flag: 0,
+            registered_delivery: d.registered_delivery,
+            data_coding: d.data_coding,
+            sm_length: 0,
+            short_message: Vec::new(),
+        }
+    }
+
+    /// Build a `Pdu` describing an inbound `cancel_sm`. smpp34 1.1.x
+    /// keeps the `cancel_sm` fields private (no accessors), so the
+    /// addressing + `message_id` cannot be surfaced yet — only the fact
+    /// that a cancel arrived. The script can still apply policy
+    /// (accept/reject); the fields light up once smpp34 exposes them.
+    /// See the operation-coverage matrix in the README.
+    pub(crate) fn cancel_stub() -> Self {
+        Self {
+            command: "cancel_sm".into(),
+            service_type: String::new(),
+            source_addr_ton: 0,
+            source_addr_npi: 0,
+            source_addr: String::new(),
+            dest_addr_ton: 0,
+            dest_addr_npi: 0,
+            destination_addr: String::new(),
+            esm_class: 0,
+            protocol_id: 0,
+            priority_flag: 0,
+            registered_delivery: 0,
+            data_coding: 0,
+            sm_length: 0,
+            short_message: Vec::new(),
+        }
+    }
+}
+
+// ── Delivery-receipt parser ─────────────────────────────────────────────
+
+/// Best-effort parse of the de-facto SMSC delivery-receipt body, e.g.
+/// `id:0a1b2 sub:001 dlvrd:001 submit date:2401011200 done
+/// date:2401011201 stat:DELIVRD err:000 text:Hello`.
+///
+/// The format is not standardised (it predates any SMPP version that
+/// tried to formalise it), so the parser recognises the canonical key
+/// set and tolerates missing keys / extra whitespace. The two-word keys
+/// (`submit date`, `done date`) are handled explicitly. `text` always
+/// runs to the end of the body.
+#[derive(Debug, Default, PartialEq)]
+pub struct Receipt {
+    pub id: Option<String>,
+    pub sub: Option<String>,
+    pub dlvrd: Option<String>,
+    pub submit_date: Option<String>,
+    pub done_date: Option<String>,
+    pub stat: Option<String>,
+    pub err: Option<String>,
+    pub text: Option<String>,
+    pub raw: String,
+}
+
+impl Receipt {
+    /// Canonical receipt keys, longest-first so `submit date` is matched
+    /// before a hypothetical `submit`. The output field name is the
+    /// snake_case form exposed to Python.
+    const KEYS: &'static [(&'static str, &'static str)] = &[
+        ("submit date", "submit_date"),
+        ("done date", "done_date"),
+        ("dlvrd", "dlvrd"),
+        ("stat", "stat"),
+        ("text", "text"),
+        ("sub", "sub"),
+        ("err", "err"),
+        ("id", "id"),
+    ];
+
+    pub fn parse(sm: &[u8]) -> Option<Receipt> {
+        let raw = String::from_utf8_lossy(sm).into_owned();
+        let hay = raw.to_ascii_lowercase();
+
+        // Locate every `<key>:` occurrence; record (byte_pos, key_len,
+        // output_field). A field is found at most once (first wins).
+        let mut hits: Vec<(usize, usize, &'static str)> = Vec::new();
+        for (key, field) in Self::KEYS {
+            let needle = format!("{key}:");
+            if let Some(pos) = hay.find(&needle) {
+                // Skip if this position is already claimed by a longer
+                // key (e.g. the `date:` inside `submit date:`).
+                if hits.iter().any(|(p, l, _)| pos >= *p && pos < p + l) {
+                    continue;
+                }
+                hits.push((pos, needle.len(), field));
+            }
+        }
+        if hits.is_empty() {
+            return None;
+        }
+        hits.sort_by_key(|(p, _, _)| *p);
+
+        let mut out = Receipt {
+            raw: raw.clone(),
+            ..Default::default()
+        };
+        for (i, (pos, key_len, field)) in hits.iter().enumerate() {
+            let val_start = pos + key_len;
+            let val_end = hits.get(i + 1).map(|(p, _, _)| *p).unwrap_or(raw.len());
+            let value = raw[val_start..val_end].trim().to_string();
+            out.set(field, value);
+        }
+        Some(out)
+    }
+
+    fn set(&mut self, field: &str, value: String) {
+        let slot = match field {
+            "id" => &mut self.id,
+            "sub" => &mut self.sub,
+            "dlvrd" => &mut self.dlvrd,
+            "submit_date" => &mut self.submit_date,
+            "done_date" => &mut self.done_date,
+            "stat" => &mut self.stat,
+            "err" => &mut self.err,
+            "text" => &mut self.text,
+            _ => return,
+        };
+        *slot = Some(value);
+    }
+
+    fn fill_dict(&self, d: &Bound<'_, PyDict>) -> PyResult<()> {
+        macro_rules! put {
+            ($k:literal, $v:expr) => {
+                if let Some(v) = &$v {
+                    d.set_item($k, v)?;
+                }
+            };
+        }
+        put!("id", self.id);
+        put!("sub", self.sub);
+        put!("dlvrd", self.dlvrd);
+        put!("submit_date", self.submit_date);
+        put!("done_date", self.done_date);
+        put!("stat", self.stat);
+        put!("err", self.err);
+        put!("text", self.text);
+        d.set_item("raw", &self.raw)?;
+        Ok(())
     }
 }
 
@@ -171,11 +364,13 @@ impl PduReply {
     }
 }
 
-// ── Bind ────────────────────────────────────────────────────────────────
+// ── Bind / BindResult ───────────────────────────────────────────────────
 
-/// Argument to `@smpp.on_bind`. Script returns truthy to accept,
-/// falsy to reject. Default behaviour with no `@smpp.on_bind` handler
-/// is reject (closed by default).
+/// Argument to `@smpp.on_bind`. The handler authorises the bind by
+/// returning `bind.accept()` or `bind.reject("ESME_RINVPASWD", "why")`.
+/// Bare truthy/falsy returns still work (truthy = accept, falsy/None =
+/// reject). With no `@smpp.on_bind` handler the default is reject —
+/// binds are closed by default.
 #[pyclass(module = "siphon.smpp", name = "Bind", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct Bind {
@@ -189,19 +384,103 @@ pub struct Bind {
 
 #[pymethods]
 impl Bind {
-    /// Sugar for `return True`.
-    fn accept(&self) -> bool {
-        true
+    /// Accept the bind. `return bind.accept()`.
+    fn accept(&self) -> BindResult {
+        BindResult {
+            accept: true,
+            status: SmppError::ESME_ROK,
+            reason: String::new(),
+        }
     }
-    /// Sugar for `return False` (any non-truthy value works too).
-    fn reject(&self) -> bool {
-        false
+
+    /// Reject the bind with an explicit SMPP status and an operator-facing
+    /// reason (logged on the reject). Defaults: `ESME_RBINDFAIL`, no
+    /// reason. Common statuses: `ESME_RINVPASWD` (bad password),
+    /// `ESME_RINVSYSID` (unknown system_id), `ESME_RBINDFAIL` (generic),
+    /// `ESME_RTHROTTLED` (rate-limited).
+    #[pyo3(signature = (status = "ESME_RBINDFAIL".to_string(), reason = String::new()))]
+    fn reject(&self, status: String, reason: String) -> PyResult<BindResult> {
+        Ok(BindResult {
+            accept: false,
+            status: parse_smpp_status(&status)?,
+            reason,
+        })
     }
 
     fn __repr__(&self) -> String {
         format!(
             "Bind(system_id={:?}, client_addr={:?})",
             self.system_id, self.client_addr
+        )
+    }
+}
+
+/// Outcome of `@smpp.on_bind` — what `bind.accept()` / `bind.reject(...)`
+/// return. The runtime reads `accept`, and on reject maps `status` onto
+/// the wire `bind_*_resp` and logs `reason`.
+#[pyclass(module = "siphon.smpp", name = "BindResult", from_py_object)]
+#[derive(Debug, Clone)]
+pub struct BindResult {
+    pub accept: bool,
+    pub status: SmppError,
+    pub reason: String,
+}
+
+#[pymethods]
+impl BindResult {
+    fn __bool__(&self) -> bool {
+        self.accept
+    }
+
+    fn __repr__(&self) -> String {
+        if self.accept {
+            "BindResult(accept)".to_string()
+        } else {
+            format!(
+                "BindResult(reject, status={:?}, reason={:?})",
+                self.status, self.reason
+            )
+        }
+    }
+}
+
+// ── AlertNotification ───────────────────────────────────────────────────
+
+/// Payload for `@smpp.on_pdu("alert_notification")` — an SMSC telling us
+/// (on an outbound bind) that a previously-unavailable MS is now
+/// reachable, so queued MT can be flushed.
+///
+/// NOTE: smpp34 1.1.x does not expose the `alert_notification` PDU
+/// fields, so `source_addr` / `esme_addr` / `ms_availability_status`
+/// arrive empty for now — the hook fires so the capability is wired, and
+/// the fields populate once smpp34 surfaces accessors. See the
+/// operation-coverage matrix in the README.
+#[pyclass(
+    module = "siphon.smpp",
+    name = "AlertNotification",
+    skip_from_py_object
+)]
+#[derive(Debug, Clone, Default)]
+pub struct AlertNotification {
+    #[pyo3(get)]
+    pub source_addr: String,
+    #[pyo3(get)]
+    pub esme_addr: String,
+    #[pyo3(get)]
+    pub ms_availability_status: Option<u8>,
+}
+
+#[pymethods]
+impl AlertNotification {
+    #[getter]
+    fn command(&self) -> &'static str {
+        "alert_notification"
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "AlertNotification(source_addr={:?}, esme_addr={:?}, ms_availability_status={:?})",
+            self.source_addr, self.esme_addr, self.ms_availability_status
         )
     }
 }
@@ -236,9 +515,10 @@ impl Session {
 
     fn __repr__(&self) -> String {
         format!(
-            "Session(kind={}, system_id={:?}, client_addr={:?})",
+            "Session(kind={}, system_id={:?}, session_id={:?}, client_addr={:?})",
             self.kind(),
             self.system_id,
+            self.session_id,
             self.client_addr
         )
     }
@@ -256,7 +536,7 @@ pub enum SourceKind {
 /// the `smpp34::SmppError` enum. Returns a clean `PyValueError` on an
 /// unknown spelling so script bugs surface immediately rather than
 /// fall through to `ESME_ROK`.
-fn parse_smpp_status(s: &str) -> PyResult<SmppError> {
+pub(crate) fn parse_smpp_status(s: &str) -> PyResult<SmppError> {
     use SmppError::*;
     Ok(match s {
         "ESME_ROK" => ESME_ROK,
@@ -436,14 +716,128 @@ mod tests {
     }
 
     #[test]
-    fn bind_accept_reject_sugar() {
+    fn pdu_is_dlr_reflects_receipt_bit() {
+        // esm_class bit 0x04 = SMSC delivery receipt.
+        assert!(make_pdu(0x04).is_dlr());
+        assert!(make_pdu(0x44).is_dlr()); // 0x04 alongside UDHI
+        assert!(!make_pdu(0x00).is_dlr());
+        assert!(!make_pdu(0x40).is_dlr()); // UDHI but not a receipt
+    }
+
+    #[test]
+    fn receipt_parses_canonical_form() {
+        let body = b"id:0a1b2c3d sub:001 dlvrd:001 submit date:2401011200 \
+                     done date:2401011201 stat:DELIVRD err:000 text:Hello world";
+        let r = Receipt::parse(body).expect("a canonical receipt parses");
+        assert_eq!(r.id.as_deref(), Some("0a1b2c3d"));
+        assert_eq!(r.sub.as_deref(), Some("001"));
+        assert_eq!(r.dlvrd.as_deref(), Some("001"));
+        assert_eq!(r.submit_date.as_deref(), Some("2401011200"));
+        assert_eq!(r.done_date.as_deref(), Some("2401011201"));
+        assert_eq!(r.stat.as_deref(), Some("DELIVRD"));
+        assert_eq!(r.err.as_deref(), Some("000"));
+        assert_eq!(r.text.as_deref(), Some("Hello world"));
+    }
+
+    #[test]
+    fn receipt_tolerates_missing_keys() {
+        // A minimal receipt — just id + stat — still parses.
+        let r = Receipt::parse(b"id:XYZ stat:EXPIRED").expect("minimal receipt parses");
+        assert_eq!(r.id.as_deref(), Some("XYZ"));
+        assert_eq!(r.stat.as_deref(), Some("EXPIRED"));
+        assert!(r.sub.is_none());
+        assert!(r.text.is_none());
+    }
+
+    #[test]
+    fn receipt_non_receipt_body_is_none() {
+        // A normal MO message with no key:value structure → not a receipt.
+        assert!(Receipt::parse(b"hey are we still on for lunch?").is_none());
+    }
+
+    #[test]
+    fn receipt_getter_only_fires_for_dlr() {
+        Python::attach(|py| {
+            // is_dlr false → receipt() is None even if the body looks
+            // receipt-shaped.
+            let mut pdu = make_pdu(0x00);
+            pdu.short_message = b"id:1 stat:DELIVRD".to_vec();
+            assert!(pdu.receipt(py).is_none());
+
+            // is_dlr true + receipt body → dict with the parsed fields.
+            let mut dlr = make_pdu(0x04);
+            dlr.short_message = b"id:1 stat:DELIVRD err:000".to_vec();
+            let d = dlr.receipt(py).expect("dlr with body yields a dict");
+            let id: String = d.get_item("id").unwrap().unwrap().extract().unwrap();
+            assert_eq!(id, "1");
+            let stat: String = d.get_item("stat").unwrap().unwrap().extract().unwrap();
+            assert_eq!(stat, "DELIVRD");
+        });
+    }
+
+    #[test]
+    fn bind_accept_yields_accept_result() {
         let b = Bind {
             system_id: "esme1".into(),
             password: "pw".into(),
             client_addr: "203.0.113.5:5000".into(),
         };
-        assert!(b.accept());
-        assert!(!b.reject());
+        let r = b.accept();
+        assert!(r.accept);
+        assert_eq!(r.status, SmppError::ESME_ROK);
+    }
+
+    #[test]
+    fn bind_reject_carries_status_and_reason() {
+        Python::attach(|_py| {
+            let b = Bind {
+                system_id: "esme1".into(),
+                password: "pw".into(),
+                client_addr: "203.0.113.5:5000".into(),
+            };
+            // explicit status + reason
+            let r = b
+                .reject("ESME_RINVPASWD".to_string(), "bad password".to_string())
+                .unwrap();
+            assert!(!r.accept);
+            assert_eq!(r.status, SmppError::ESME_RINVPASWD);
+            assert_eq!(r.reason, "bad password");
+
+            // defaults: generic bind failure, no reason
+            let d = b
+                .reject("ESME_RBINDFAIL".to_string(), String::new())
+                .unwrap();
+            assert_eq!(d.status, SmppError::ESME_RBINDFAIL);
+            assert_eq!(d.reason, "");
+        });
+    }
+
+    #[test]
+    fn bind_reject_unknown_status_errors() {
+        Python::attach(|_py| {
+            let b = Bind {
+                system_id: "x".into(),
+                password: "y".into(),
+                client_addr: "z".into(),
+            };
+            assert!(b.reject("ESME_BOGUS".to_string(), String::new()).is_err());
+        });
+    }
+
+    #[test]
+    fn bind_result_bool_reflects_accept() {
+        let yes = BindResult {
+            accept: true,
+            status: SmppError::ESME_ROK,
+            reason: String::new(),
+        };
+        let no = BindResult {
+            accept: false,
+            status: SmppError::ESME_RBINDFAIL,
+            reason: "nope".into(),
+        };
+        assert!(yes.__bool__());
+        assert!(!no.__bool__());
     }
 
     #[test]

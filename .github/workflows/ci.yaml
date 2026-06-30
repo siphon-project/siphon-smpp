@@ -40,3 +40,9 @@ jobs:
 
       - name: Test
         run: cargo test --all-features
+
+      - name: Benches compile
+        run: cargo bench --no-run
+
+      - name: Leak check
+        run: cargo run --release --example leak_check
