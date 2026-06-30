@@ -18,8 +18,11 @@ use std::ffi::CString;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 
-use crate::pyclasses::{Bind, Pdu, PduReply, Session};
-use crate::submit::{submit_via, SubmitResp};
+use crate::pyclasses::{AlertNotification, Bind, BindResult, Pdu, PduReply, Session};
+use crate::sends::{
+    alert_to, cancel_via, data_to, data_via, deliver_to, query_via, replace_via, submit_via,
+    QueryResp, SmppResp,
+};
 use crate::SmppConfig;
 
 const NAMESPACE_SOURCE: &str = include_str!("../python/smpp.py");
@@ -43,22 +46,37 @@ pub fn namespace(
 
         // ── Rust pyclasses for handler dispatch ────────────────────
         // The dispatcher in `runtime.rs` constructs `Pdu`, `Session`,
-        // `Bind` instances and passes them into script handlers; the
-        // script reads fields and calls `pdu.reply(...)` returning a
-        // `PduReply`. Expose all of them on the namespace so scripts
-        // can also import the types for static-typing helpers.
+        // `Bind`, `AlertNotification` instances and passes them into
+        // script handlers; the script reads fields and calls
+        // `pdu.reply(...)` / `bind.accept()` / `bind.reject(...)`,
+        // returning a `PduReply` / `BindResult`. Expose all of them on
+        // the namespace so scripts can also import the types for
+        // static-typing helpers.
         module.add_class::<Pdu>()?;
         module.add_class::<PduReply>()?;
         module.add_class::<Session>()?;
         module.add_class::<Bind>()?;
-        module.add_class::<SubmitResp>()?;
+        module.add_class::<BindResult>()?;
+        module.add_class::<AlertNotification>()?;
+        module.add_class::<SmppResp>()?;
+        module.add_class::<QueryResp>()?;
 
-        // ── Outbound submission via configured binds ──────────────
-        // `submit_via` needs the runtime state (set by the task);
-        // the function itself is import-time-safe and returns an
-        // awaitable that errors with a clear message if state isn't
-        // up yet.
+        // ── Send helpers ──────────────────────────────────────────
+        // These need the runtime state (set by the task); each is
+        // import-time-safe and returns an awaitable that errors with a
+        // clear message if state isn't up yet. Two families:
+        //   * outbound, target a bind by name: submit_via / data_via /
+        //     cancel_via (+ query_via / replace_via forward-compat stubs)
+        //   * inbound, target a bound ESME by session_id: deliver_to /
+        //     data_to / alert_to
         module.add_function(wrap_pyfunction!(submit_via, &module)?)?;
+        module.add_function(wrap_pyfunction!(data_via, &module)?)?;
+        module.add_function(wrap_pyfunction!(cancel_via, &module)?)?;
+        module.add_function(wrap_pyfunction!(query_via, &module)?)?;
+        module.add_function(wrap_pyfunction!(replace_via, &module)?)?;
+        module.add_function(wrap_pyfunction!(deliver_to, &module)?)?;
+        module.add_function(wrap_pyfunction!(data_to, &module)?)?;
+        module.add_function(wrap_pyfunction!(alert_to, &module)?)?;
 
         Ok(module.into_any().unbind())
     }

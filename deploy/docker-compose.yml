@@ -1,0 +1,44 @@
+# Local SMSC stack for development.
+#
+# `smsc` is YOUR siphon binary (built from deploy/Dockerfile) with the
+# siphon-smpp addon. The handler script and addon config are bind-mounted
+# so you can edit smpp.py and let siphon hot-reload it — no rebuild.
+#
+#   docker compose -f deploy/docker-compose.yml up --build
+#
+# Point an SMPP client (e.g. the open-source `smpp` CLIs, Kannel's
+# test tools, or your own ESME) at localhost:2775 to bind + submit.
+
+services:
+  smsc:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+      args:
+        SMSC_BIN: your-smsc
+    image: your-registry/your-smsc:latest
+    ports:
+      - "2775:2775"            # SMPP listener
+    environment:
+      SMPP_CONFIG: /etc/smsc/smpp.yaml
+      # Outbound bind secrets via env (keep them out of the yaml):
+      SMPP_ALPHA_SYSTEM_ID: alpha_esme
+      SMPP_ALPHA_PASSWORD: changeme
+      # Or declare a whole bind from the environment:
+      # SMPP_BIND_GAMMA_HOST: smsc-c.example.net
+      # SMPP_BIND_GAMMA_SYSTEM_ID: gamma_esme
+      # SMPP_BIND_GAMMA_PASSWORD: ...
+    volumes:
+      # Hot-reload: edit these on the host, siphon reloads on next PDU.
+      - ../examples/gateway.py:/etc/smsc/python/smpp_script.py:ro
+      - ./smpp.example.yaml:/etc/smsc/smpp.yaml:ro
+    healthcheck:
+      # A bound listener answers a TCP connect; a real check would bind +
+      # enquire_link. `nc` keeps the image dependency-free here.
+      test: ["CMD-SHELL", "exec 3<>/dev/tcp/127.0.0.1/2775 || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 3
+      start_period: 10s
+    stop_grace_period: 30s     # let outbound binds unbind cleanly
+    restart: unless-stopped

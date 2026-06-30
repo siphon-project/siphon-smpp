@@ -48,5 +48,6 @@ confidence-threshold = 0.9
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-# siphon-sip is consumed as a git dependency until it is published to crates.io.
-allow-git = ["https://github.com/siphon-project/siphon"]
+# siphon-sip (the host platform) is consumed as a permanent git dependency —
+# siphon-smpp is an extension, not a crates.io crate.
+allow-git = ["https://github.com/siphon-project/siphon-sip"]

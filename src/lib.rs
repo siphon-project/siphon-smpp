@@ -51,10 +51,11 @@ pub mod config;
 pub mod install;
 pub mod pyclasses;
 pub mod runtime;
-pub mod submit;
+pub mod sends;
 
 pub use config::SmppConfig;
 pub use install::{namespace, task};
+pub use pyclasses::{Pdu, Receipt};
 
 #[derive(Debug, thiserror::Error)]
 pub enum InstallError {

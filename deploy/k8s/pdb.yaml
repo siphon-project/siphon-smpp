@@ -1,0 +1,14 @@
+# Keep at least one SMSC replica serving during voluntary disruptions
+# (node drain, cluster upgrade). With replicas: 2 this means drains take
+# one replica at a time, so ESMEs always have a survivor to rebind to.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: smsc
+  labels:
+    app: smsc
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: smsc

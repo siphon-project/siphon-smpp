@@ -1,0 +1,93 @@
+# SMSC Deployment — HA across nodes.
+#
+# SMPP is stateful per TCP session, so "HA" here means: spread replicas
+# across nodes, fail fast, and let ESMEs rebind to a surviving replica.
+# See deploy/k8s/README.md for the failover model + trade-offs.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: smsc
+  labels:
+    app: smsc
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: smsc
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0        # never drop below desired during a roll
+      maxSurge: 1
+  template:
+    metadata:
+      labels:
+        app: smsc
+    spec:
+      # Spread replicas across nodes so one node loss can't take the
+      # whole SMSC down.
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: DoNotSchedule
+          labelSelector:
+            matchLabels:
+              app: smsc
+      # Drain time: let outbound binds unbind + in-flight responses
+      # settle before SIGKILL.
+      terminationGracePeriodSeconds: 45
+      containers:
+        - name: smsc
+          image: your-registry/your-smsc:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: smpp
+              containerPort: 2775
+              protocol: TCP
+          env:
+            - name: SMPP_CONFIG
+              value: /etc/smsc/smpp.yaml
+          envFrom:
+            - secretRef:
+                name: smsc-secrets
+          volumeMounts:
+            - name: config
+              mountPath: /etc/smsc
+          # Readiness: the SMPP port accepts connections. Gate traffic on
+          # this so the Service only routes to replicas that can bind.
+          readinessProbe:
+            tcpSocket:
+              port: smpp
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          # Liveness: restart a wedged replica.
+          livenessProbe:
+            tcpSocket:
+              port: smpp
+            initialDelaySeconds: 15
+            periodSeconds: 20
+            failureThreshold: 3
+          lifecycle:
+            preStop:
+              # Give the LB time to stop sending new binds before the
+              # process exits (your binary should also unbind on SIGTERM).
+              exec:
+                command: ["sleep", "10"]
+          resources:
+            requests:
+              cpu: "250m"
+              memory: "128Mi"
+            limits:
+              cpu: "2"
+              memory: "512Mi"
+      volumes:
+        - name: config
+          projected:
+            sources:
+              - configMap:
+                  name: smsc-config
+                  items:
+                    - key: smpp.yaml
+                      path: smpp.yaml
+                    - key: smpp_script.py
+                      path: python/smpp_script.py

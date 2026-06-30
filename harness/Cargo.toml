@@ -1,0 +1,26 @@
+[package]
+name = "smpp-load"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT"
+description = "SMPP load driver + mock SMSC for load-testing a siphon-smpp SMSC"
+# Dev/test tooling only — a standalone, excluded workspace so a root
+# `cargo build` of siphon-smpp never builds it, and it stays a lightweight
+# pure-smpp34 client (no siphon / pyo3 / libpython in the graph).
+publish = false
+
+[[bin]]
+name = "smpp-load"
+path = "src/main.rs"
+
+[dependencies]
+# Drives both ends with RTT's SMPP codec — the same wire library siphon-smpp
+# uses, so the load path is faithful.
+smpp34 = "1.2"
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+async-trait = "0.1"
+
+# Standalone workspace so this package never joins siphon-smpp's graph.
+[workspace]

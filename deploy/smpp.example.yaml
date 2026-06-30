@@ -1,0 +1,51 @@
+# Example siphon-smpp addon config (smpp.yaml).
+#
+# Referenced from your siphon binary's config and/or via env. Every value
+# here can also be supplied by environment variable:
+#   * ${VAR} / ${VAR:-default} expansion is applied to this file
+#   * outbound binds can be declared entirely via SMPP_BIND_<NAME>_* vars
+#     (see below) — handy for secrets you don't want in a file.
+#
+# All hostnames/IDs are synthetic.
+
+server:
+  # Inbound SMPP listener (ESMEs bind to us).
+  bind_address: "0.0.0.0"
+  port: 2775
+  session_init_timer_ms: 5000
+  enquire_link_timer_ms: 30000
+  inactivity_timer_ms: 300000
+  response_timer_ms: 30000
+
+binds:
+  # Outbound binds (we bind to upstream SMSCs / aggregators).
+  - name: alpha
+    host: smsc-a.example.net
+    port: 2775
+    system_id: ${SMPP_ALPHA_SYSTEM_ID:-alpha_esme}
+    password: ${SMPP_ALPHA_PASSWORD:-changeme}
+    bind_type: transceiver
+    max_msg_per_sec: 50          # outbound throttle (0 = unlimited)
+  - name: beta
+    host: smsc-b.example.org
+    port: 2775
+    system_id: ${SMPP_BETA_SYSTEM_ID:-beta_esme}
+    password: ${SMPP_BETA_PASSWORD:-changeme}
+    bind_type: transceiver
+
+routing:
+  # Declarative routing read by your script via smpp.routing_rules().
+  # Longest-matching prefix wins; otherwise the default chain. A chain
+  # step "bind:<name>" selects an outbound bind.
+  default_chain: ["bind:beta"]
+  rules:
+    - prefix: "1555"
+      name: north-america
+      chain: ["bind:alpha"]
+
+# Outbound binds can also be injected purely from the environment, e.g.:
+#   SMPP_BIND_GAMMA_HOST=smsc-c.example.net
+#   SMPP_BIND_GAMMA_PORT=2775
+#   SMPP_BIND_GAMMA_SYSTEM_ID=gamma_esme
+#   SMPP_BIND_GAMMA_PASSWORD=...
+#   SMPP_BIND_GAMMA_MAX_MPS=100

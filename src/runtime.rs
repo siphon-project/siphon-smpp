@@ -3,62 +3,126 @@
 //! Drives both directions:
 //!
 //! * **Client / binds** — for each `cfg.binds` entry, an `SmppClient`
-//!   with reconnect-with-backoff. `SmppClientListener::on_deliver_sm`
-//!   dispatches inbound MT (from the aggregator) into the script's
-//!   `@smpp.on_pdu("deliver_sm")` handlers. Bound `SMSC` handles are
-//!   tracked in [`State`] so `smpp.submit_via(bind=…)` can reach the
-//!   right session.
+//!   with reconnect-with-backoff. The client listener dispatches inbound
+//!   `deliver_sm` (incl. delivery receipts), `data_sm` and
+//!   `alert_notification` into the script's `@smpp.on_pdu(...)` handlers.
+//!   Bound `SMSC` handles are tracked in [`State`] so the outbound send
+//!   helpers (`smpp.submit_via(bind=…)` etc.) can reach the right
+//!   session.
 //! * **Server** — `SmppServer` accepts inbound binds on the configured
-//!   listen address. `bind_transmitter` and `bind_receiver` are
-//!   rejected (mirrors the reference policy); `bind_transceiver` is
-//!   handed to `@smpp.on_bind` for accept/reject. `on_submit_sm`
-//!   dispatches into `@smpp.on_pdu("submit_sm")`.
+//!   listen address. `bind_transmitter` / `bind_receiver` are rejected;
+//!   `bind_transceiver` is handed to `@smpp.on_bind` for accept/reject
+//!   *with an explicit status + reason*. `submit_sm`, `data_sm` and
+//!   `cancel_sm` dispatch into `@smpp.on_pdu(...)`. Bound ESME sessions
+//!   are tracked so `smpp.deliver_to(session_id=…)` can MT back to them.
 //!
-//! Shared state — both listeners read the script handler table from
-//! the [`siphon::script::ScriptHandle`] every dispatch (via
-//! `handlers_for("smpp.on_pdu")`), so a hot-reloaded script is picked
-//! up on the next PDU.
+//! Both listeners read the script handler table from the
+//! [`siphon::script::ScriptHandle`] on every dispatch (via
+//! `handlers_for(...)`), so a hot-reloaded script is picked up on the
+//! next PDU.
 
 use std::sync::{Arc, OnceLock};
+use std::time::Instant;
 
 use async_trait::async_trait;
 use pyo3::prelude::*;
 use siphon::script::ScriptHandle;
 use smpp34::{
-    bind_receiver, bind_receiver_resp, bind_transceiver, bind_transceiver_resp, bind_transmitter,
-    bind_transmitter_resp,
+    alert_notification, bind_receiver, bind_receiver_resp, bind_transceiver, bind_transceiver_resp,
+    bind_transmitter, bind_transmitter_resp, cancel_sm, cancel_sm_resp,
     client::{SmppClient, SmppClientListener, BIND_TYPE, SMSC},
-    deliver_sm, deliver_sm_resp,
+    data_sm, data_sm_resp, deliver_sm, deliver_sm_resp, query_sm, query_sm_resp, replace_sm,
+    replace_sm_resp,
     server::ESME,
     submit_sm, submit_sm_resp, SmppConnectionInformation, SmppError, SmppServer,
     SmppServerListener,
 };
 use tokio::sync::Mutex;
 
-use crate::pyclasses::{Bind, Pdu, PduReply, Session, SourceKind};
+use crate::pyclasses::{AlertNotification, Bind, BindResult, Pdu, PduReply, Session, SourceKind};
 use crate::{config::BindConfig, SmppConfig};
 
 // ── Shared state ────────────────────────────────────────────────────────
 
 pub(crate) struct State {
     pub binds: Mutex<Vec<BindSession>>,
-    pub esmes: Mutex<Vec<ESME>>,
+    /// Bound inbound ESME sessions, behind `Arc` so a send helper can
+    /// clone the handle out, drop the lock, and await without blocking
+    /// other sessions behind the mutex.
+    pub esmes: Mutex<Vec<Arc<ESME>>>,
     pub script: ScriptHandle,
 }
 
 pub(crate) struct BindSession {
     pub name: String,
-    /// `Arc` so `submit_via` can clone the handle out of the bind
+    /// `Arc` so the send helpers can clone the handle out of the bind
     /// list, drop the lock, and await the response without blocking
     /// other binds behind a single mutex.
     pub smsc: Arc<SMSC>,
+    /// Per-bind outbound rate limiter (`max_msg_per_sec`); `None` when
+    /// unlimited.
+    pub throttle: Option<Arc<RateLimiter>>,
 }
 
 pub(crate) static STATE: OnceLock<Arc<State>> = OnceLock::new();
 
-/// Public accessor used by the namespace pyclass's `submit_via`.
+/// Public accessor used by the send helpers in [`crate::sends`].
 pub(crate) fn state() -> Option<Arc<State>> {
     STATE.get().cloned()
+}
+
+// ── Rate limiter (token bucket) ─────────────────────────────────────────
+
+/// Simple async token-bucket, one per bind, used to honour
+/// `max_msg_per_sec` on outbound sends. Paces (awaits) rather than
+/// rejecting — an aggregator's throughput cap is a speed limit, not an
+/// error. Capacity is one second's worth of tokens, so short bursts pass
+/// through and sustained load settles at the configured rate.
+pub(crate) struct RateLimiter {
+    inner: Mutex<Bucket>,
+}
+
+struct Bucket {
+    tokens: f64,
+    max: f64,
+    refill_per_sec: f64,
+    last: Instant,
+}
+
+impl RateLimiter {
+    /// `rate` is messages/second; must be > 0 (callers pass `None`
+    /// instead of a zero-rate limiter).
+    pub(crate) fn new(rate: u32) -> Self {
+        let r = f64::from(rate.max(1));
+        Self {
+            inner: Mutex::new(Bucket {
+                tokens: r,
+                max: r,
+                refill_per_sec: r,
+                last: Instant::now(),
+            }),
+        }
+    }
+
+    /// Block until a token is available, then consume it.
+    pub(crate) async fn acquire(&self) {
+        loop {
+            let wait = {
+                let mut b = self.inner.lock().await;
+                let now = Instant::now();
+                let elapsed = now.duration_since(b.last).as_secs_f64();
+                b.tokens = (b.tokens + elapsed * b.refill_per_sec).min(b.max);
+                b.last = now;
+                if b.tokens >= 1.0 {
+                    b.tokens -= 1.0;
+                    return;
+                }
+                let deficit = 1.0 - b.tokens;
+                std::time::Duration::from_secs_f64(deficit / b.refill_per_sec)
+            };
+            tokio::time::sleep(wait).await;
+        }
+    }
 }
 
 // ── Spawn ───────────────────────────────────────────────────────────────
@@ -124,7 +188,7 @@ pub fn spawn(cfg: SmppConfig, script: ScriptHandle) {
 ///
 /// `SmppClient::start` does NOT block until disconnect — it kicks off
 /// the connect+bind in a `tokio::spawn(...)` and returns in microseconds
-/// (smpp34/src/client/mod.rs:367). So we drive the lifecycle ourselves:
+/// (smpp34/src/client/mod.rs). So we drive the lifecycle ourselves:
 ///
 ///   1. start() — spawns the I/O task
 ///   2. wait for `is_alive()` to flip true (the spawned task sets this
@@ -133,14 +197,6 @@ pub fn spawn(cfg: SmppConfig, script: ScriptHandle) {
 ///   3. once alive, poll `is_alive()` until it flips false (peer closed,
 ///      enquire_link / response timeout fired, etc.)
 ///   4. log "bind down", apply backoff, loop
-///
-/// Treating start() as blocking — which the original code did — caused
-/// every iteration to immediately log "bind down" and then race ahead
-/// to spawn a fresh `SmppClient` while the previous one's spawned tasks
-/// were still alive. The user-visible symptom was multiple concurrent
-/// sessions to the same aggregator hostname, each on a different
-/// NLB-resolved IP, with the supervisor cycling on its own backoff
-/// schedule rather than tracking actual session liveness.
 async fn run_bind_loop(state: Arc<State>, cfg: BindConfig) {
     let bind_type = match cfg.bind_type.as_str() {
         "transmitter" => BIND_TYPE::TX,
@@ -150,6 +206,7 @@ async fn run_bind_loop(state: Arc<State>, cfg: BindConfig) {
     let listener: Arc<dyn SmppClientListener + Send + Sync> = Arc::new(BindListener {
         state: state.clone(),
         bind_name: cfg.name.clone(),
+        max_msg_per_sec: cfg.max_msg_per_sec,
     });
 
     // session_init_timer in the smpp34 client is 5s; give the bind a
@@ -191,14 +248,14 @@ async fn run_bind_loop(state: Arc<State>, cfg: BindConfig) {
         client.start().await;
 
         // Phase 1: wait for bind to complete (or fail).
-        let bind_started = std::time::Instant::now();
+        let bind_started = Instant::now();
         while !client.is_alive() && bind_started.elapsed() < bind_deadline {
             tokio::time::sleep(poll_interval).await;
         }
 
         // Phase 2: if bound, hold the session until is_alive() flips false.
         let bound_at = if client.is_alive() {
-            let now = std::time::Instant::now();
+            let now = Instant::now();
             while client.is_alive() {
                 tokio::time::sleep(poll_interval).await;
             }
@@ -258,27 +315,20 @@ impl SmppServerListener for State {
         conn: &SmppConnectionInformation,
         _session: &String,
     ) -> bind_transceiver_resp {
-        let approved = match dispatch_bind(
+        let outcome = dispatch_bind(
             &self.script,
             &request.system_id,
             &request.password,
             &conn.client_address.to_string(),
         )
-        .await
-        {
-            Ok(ok) => ok,
-            Err(e) => {
-                tracing::warn!(target: "siphon_smpp",
-                    error=%e, system_id=%request.system_id,
-                    "@smpp.on_bind raised; rejecting");
-                false
-            }
-        };
-        if !approved {
+        .await;
+
+        if !outcome.accept {
             tracing::info!(target: "siphon_smpp",
                 from=%conn.client_address, system_id=%request.system_id,
-                "bind_transceiver rejected by script");
-            return request.reject(SmppError::ESME_RBINDFAIL);
+                status=?outcome.status, reason=%outcome.reason,
+                "bind_transceiver rejected");
+            return request.reject(outcome.status);
         }
         tracing::info!(target: "siphon_smpp",
             from=%conn.client_address, system_id=%request.system_id,
@@ -296,12 +346,7 @@ impl SmppServerListener for State {
         session_id: &String,
     ) -> submit_sm_resp {
         let pdu = Pdu::from_submit(&request);
-        let session = Session {
-            kind: SourceKind::EsmeServer,
-            session_id: session_id.clone(),
-            system_id: String::new(), // populated post-bind in self.esmes
-            client_addr: conn.client_address.to_string(),
-        };
+        let session = self.esme_session(session_id, conn).await;
         match dispatch_pdu(&self.script, "submit_sm", pdu, session).await {
             Ok(reply) => match reply.message_id {
                 Some(id) => request.accept(id),
@@ -315,25 +360,161 @@ impl SmppServerListener for State {
         }
     }
 
-    // on_cancel_sm (reject ESME_RCANCELFAIL) and on_data_sm (reject
-    // ESME_RSYSERR) use the trait defaults.
+    async fn on_data_sm(
+        &self,
+        request: data_sm,
+        conn: &SmppConnectionInformation,
+        session_id: &String,
+    ) -> data_sm_resp {
+        let pdu = Pdu::from_data(&request);
+        let session = self.esme_session(session_id, conn).await;
+        match dispatch_pdu_opt(&self.script, "data_sm", pdu, session).await {
+            // No handler → reject (data_sm is opt-in, like the smpp34 default).
+            None => request.reject(SmppError::ESME_RSYSERR),
+            Some(Ok(reply)) => match reply.message_id {
+                Some(id) => request.accept(id),
+                None if reply.command_status == SmppError::ESME_ROK => {
+                    request.accept(String::new())
+                }
+                None => request.reject(reply.command_status),
+            },
+            Some(Err(e)) => {
+                tracing::error!(target: "siphon_smpp",
+                    error=%e, "@smpp.on_pdu(data_sm) raised");
+                request.reject(SmppError::ESME_RSYSERR)
+            }
+        }
+    }
+
+    async fn on_cancel_sm(
+        &self,
+        request: cancel_sm,
+        conn: &SmppConnectionInformation,
+        session_id: &String,
+    ) -> cancel_sm_resp {
+        let pdu = Pdu::from_cancel(&request);
+        let session = self.esme_session(session_id, conn).await;
+        match dispatch_pdu_opt(&self.script, "cancel_sm", pdu, session).await {
+            None => request.reject(SmppError::ESME_RCANCELFAIL),
+            Some(Ok(reply)) if reply.command_status == SmppError::ESME_ROK => request.accept(),
+            Some(Ok(reply)) => request.reject(reply.command_status),
+            Some(Err(e)) => {
+                tracing::error!(target: "siphon_smpp",
+                    error=%e, "@smpp.on_pdu(cancel_sm) raised");
+                request.reject(SmppError::ESME_RCANCELFAIL)
+            }
+        }
+    }
+
+    async fn on_query_sm(
+        &self,
+        request: query_sm,
+        conn: &SmppConnectionInformation,
+        session_id: &String,
+    ) -> query_sm_resp {
+        let pdu = Pdu::from_query(&request);
+        let session = self.esme_session(session_id, conn).await;
+        match dispatch_pdu_opt(&self.script, "query_sm", pdu, session).await {
+            None => request.reject(SmppError::ESME_RQUERYFAIL),
+            Some(Ok(reply)) if reply.command_status == SmppError::ESME_ROK => request.accept(
+                reply.message_id.unwrap_or_default(),
+                reply.final_date,
+                reply.message_state.unwrap_or(0),
+                reply.error_code,
+            ),
+            Some(Ok(reply)) => request.reject(reply.command_status),
+            Some(Err(e)) => {
+                tracing::error!(target: "siphon_smpp",
+                    error=%e, "@smpp.on_pdu(query_sm) raised");
+                request.reject(SmppError::ESME_RQUERYFAIL)
+            }
+        }
+    }
+
+    async fn on_replace_sm(
+        &self,
+        request: replace_sm,
+        conn: &SmppConnectionInformation,
+        session_id: &String,
+    ) -> replace_sm_resp {
+        let pdu = Pdu::from_replace(&request);
+        let session = self.esme_session(session_id, conn).await;
+        match dispatch_pdu_opt(&self.script, "replace_sm", pdu, session).await {
+            None => request.reject(SmppError::ESME_RREPLACEFAIL),
+            Some(Ok(reply)) if reply.command_status == SmppError::ESME_ROK => request.accept(),
+            Some(Ok(reply)) => request.reject(reply.command_status),
+            Some(Err(e)) => {
+                tracing::error!(target: "siphon_smpp",
+                    error=%e, "@smpp.on_pdu(replace_sm) raised");
+                request.reject(SmppError::ESME_RREPLACEFAIL)
+            }
+        }
+    }
 
     async fn on_timeout(&self, _seq: u32, session_id: &String) {
-        let binding = self.esmes.lock().await;
-        if let Some(esme) = binding.iter().find(|e| e.session_id == *session_id) {
+        let esme = {
+            let binding = self.esmes.lock().await;
+            binding
+                .iter()
+                .find(|e| e.session_id == *session_id)
+                .cloned()
+        };
+        if let Some(esme) = esme {
             let _ = esme.send_unbind().await;
         }
     }
 
-    async fn on_esme_bound(&self, esme: ESME, _session: &String) {
-        self.esmes.lock().await.push(esme);
+    async fn on_esme_bound(&self, esme: ESME, session_id: &String) {
+        let session = Session {
+            kind: SourceKind::EsmeServer,
+            session_id: session_id.clone(),
+            system_id: esme.system_id.clone(),
+            client_addr: esme.client_address.to_string(),
+        };
+        self.esmes.lock().await.push(Arc::new(esme));
+        dispatch_session(&self.script, "bound", session).await;
     }
 
     async fn on_esme_unbound(&self, session_id: &String) {
-        self.esmes
-            .lock()
-            .await
-            .retain(|e| e.session_id != *session_id);
+        let removed = {
+            let mut esmes = self.esmes.lock().await;
+            let found = esmes
+                .iter()
+                .find(|e| e.session_id == *session_id)
+                .map(|e| (e.system_id.clone(), e.client_address.to_string()));
+            esmes.retain(|e| e.session_id != *session_id);
+            found
+        };
+        let (system_id, client_addr) = removed.unwrap_or_default();
+        let session = Session {
+            kind: SourceKind::EsmeServer,
+            session_id: session_id.clone(),
+            system_id,
+            client_addr,
+        };
+        dispatch_session(&self.script, "unbound", session).await;
+    }
+}
+
+impl State {
+    /// Build the `Session` passed to inbound `@smpp.on_pdu` handlers,
+    /// resolving `system_id` from the bound ESME list (the per-PDU
+    /// connection info doesn't carry it).
+    async fn esme_session(&self, session_id: &str, conn: &SmppConnectionInformation) -> Session {
+        let system_id = {
+            let esmes = self.esmes.lock().await;
+            esmes
+                .iter()
+                .find(|e| e.session_id == session_id)
+                .map(|e| e.system_id.clone())
+                .unwrap_or_default()
+        };
+        Session {
+            kind: SourceKind::EsmeServer,
+            session_id: session_id.to_string(),
+            system_id,
+            client_addr: conn.client_address.to_string(),
+        }
     }
 }
 
@@ -342,6 +523,7 @@ impl SmppServerListener for State {
 struct BindListener {
     state: Arc<State>,
     bind_name: String,
+    max_msg_per_sec: u32,
 }
 
 #[async_trait]
@@ -354,19 +536,11 @@ impl SmppClientListener for BindListener {
         conn: &SmppConnectionInformation,
         session_id: &String,
     ) -> deliver_sm_resp {
-        // Delivery receipt — protocol-level ack only; the script may
-        // observe via metrics / log lines but doesn't decide outcome.
-        if request.esm_class & 0x04 != 0 {
-            return request.accept();
-        }
-
+        // Dispatch EVERY deliver_sm — including delivery receipts
+        // (esm_class & 0x04). The script inspects `pdu.is_dlr` /
+        // `pdu.receipt` and routes the DLR back to the originating ESME.
         let pdu = Pdu::from_deliver(&request);
-        let session = Session {
-            kind: SourceKind::Bind,
-            session_id: session_id.clone(),
-            system_id: self.bind_name.clone(),
-            client_addr: conn.server_address.to_string(),
-        };
+        let session = self.bind_session(session_id, conn);
         match dispatch_pdu(&self.state.script, "deliver_sm", pdu, session).await {
             Ok(reply) if reply.command_status == SmppError::ESME_ROK => request.accept(),
             Ok(reply) => request.reject(reply.command_status),
@@ -379,8 +553,45 @@ impl SmppClientListener for BindListener {
         }
     }
 
-    // on_data_sm (reject ESME_RSYSERR) and on_alert_notification (no-op) use
-    // the trait defaults.
+    async fn on_data_sm(
+        &self,
+        request: data_sm,
+        conn: &SmppConnectionInformation,
+        session_id: &String,
+    ) -> data_sm_resp {
+        let pdu = Pdu::from_data(&request);
+        let session = self.bind_session(session_id, conn);
+        match dispatch_pdu_opt(&self.state.script, "data_sm", pdu, session).await {
+            None => request.reject(SmppError::ESME_RSYSERR),
+            Some(Ok(reply)) if reply.command_status == SmppError::ESME_ROK => {
+                request.accept(reply.message_id.unwrap_or_default())
+            }
+            Some(Ok(reply)) => request.reject(reply.command_status),
+            Some(Err(e)) => {
+                tracing::error!(target: "siphon_smpp",
+                    bind=%self.bind_name, error=%e,
+                    "@smpp.on_pdu(data_sm) raised");
+                request.reject(SmppError::ESME_RSYSERR)
+            }
+        }
+    }
+
+    async fn on_alert_notification(
+        &self,
+        request: alert_notification,
+        conn: &SmppConnectionInformation,
+        session_id: &String,
+    ) {
+        // Notification only (no wire response): dispatch so the script can
+        // react, e.g. flush queued MT for the now-available MS.
+        let alert = AlertNotification::from_alert(&request);
+        let session = self.bind_session(session_id, conn);
+        if let Err(e) = dispatch_alert(&self.state.script, alert, session).await {
+            tracing::error!(target: "siphon_smpp",
+                bind=%self.bind_name, error=%e,
+                "@smpp.on_pdu(alert_notification) raised");
+        }
+    }
 
     async fn on_timeout(&self, _seq: u32, session_id: &String) {
         let smsc = {
@@ -395,46 +606,98 @@ impl SmppClientListener for BindListener {
         }
     }
 
-    async fn on_smsc_bound(&self, smsc: SMSC, _session: &String) {
+    async fn on_smsc_bound(&self, smsc: SMSC, session_id: &String) {
         tracing::info!(target: "siphon_smpp",
             bind=%self.bind_name, system_id=%smsc.system_id,
             "outbound bind up");
+        let throttle =
+            (self.max_msg_per_sec > 0).then(|| Arc::new(RateLimiter::new(self.max_msg_per_sec)));
+        let session = Session {
+            kind: SourceKind::Bind,
+            session_id: session_id.clone(),
+            system_id: self.bind_name.clone(),
+            client_addr: smsc.server_address.to_string(),
+        };
         self.state.binds.lock().await.push(BindSession {
             name: self.bind_name.clone(),
             smsc: Arc::new(smsc),
+            throttle,
         });
+        dispatch_session(&self.state.script, "bound", session).await;
     }
 
     async fn on_smsc_unbound(&self, session_id: &String) {
-        let mut binding = self.state.binds.lock().await;
-        let before = binding.len();
-        binding.retain(|t| t.smsc.session_id != *session_id);
-        if before > binding.len() {
+        let removed = {
+            let mut binding = self.state.binds.lock().await;
+            let before = binding.len();
+            binding.retain(|t| t.smsc.session_id != *session_id);
+            before > binding.len()
+        };
+        if removed {
             tracing::warn!(target: "siphon_smpp",
                 bind=%self.bind_name, "bind unbound");
+            let session = Session {
+                kind: SourceKind::Bind,
+                session_id: session_id.clone(),
+                system_id: self.bind_name.clone(),
+                client_addr: String::new(),
+            };
+            dispatch_session(&self.state.script, "unbound", session).await;
+        }
+    }
+}
+
+impl BindListener {
+    fn bind_session(&self, session_id: &str, conn: &SmppConnectionInformation) -> Session {
+        Session {
+            kind: SourceKind::Bind,
+            session_id: session_id.to_string(),
+            system_id: self.bind_name.clone(),
+            client_addr: conn.server_address.to_string(),
         }
     }
 }
 
 // ── Dispatch helpers ────────────────────────────────────────────────────
 
-/// Look up matching `@smpp.on_pdu("<command>")` handlers in the script
-/// registry, build a `Pdu` + `Session` pyobject, call the first
-/// matching handler, parse its return into a [`PduReply`]. If no
-/// handler matches, default to `ESME_ROK` accept (server side) /
-/// successful ack (bind side) so the wire ack still fires.
+/// Dispatch a PDU to its `@smpp.on_pdu("<command>")` handler. If no
+/// handler matches, default to a soft `ESME_ROK` accept so the wire ack
+/// still fires (used for the always-acked paths: submit_sm, deliver_sm).
 async fn dispatch_pdu(
     script: &ScriptHandle,
     command: &str,
     pdu: Pdu,
     session: Session,
 ) -> PyResult<PduReply> {
-    let handler = pick_pdu_handler(script, command)?;
-    let handler = match handler {
-        Some(h) => h,
-        None => return Ok(PduReply::default_ok()),
-    };
+    match dispatch_pdu_opt(script, command, pdu, session).await {
+        Some(r) => r,
+        None => Ok(PduReply::default_ok()),
+    }
+}
 
+/// Like [`dispatch_pdu`] but returns `None` when no handler is
+/// registered, so the caller can choose the no-handler default (used for
+/// the opt-in paths: data_sm, cancel_sm reject by default).
+async fn dispatch_pdu_opt(
+    script: &ScriptHandle,
+    command: &str,
+    pdu: Pdu,
+    session: Session,
+) -> Option<PyResult<PduReply>> {
+    let handler = match pick_pdu_handler(script, command) {
+        Ok(Some(h)) => h,
+        Ok(None) => return None,
+        Err(e) => return Some(Err(e)),
+    };
+    Some(call_pdu_handler(script, handler, pdu, session).await)
+}
+
+async fn call_pdu_handler(
+    script: &ScriptHandle,
+    handler: siphon::script::HandlerHandle,
+    pdu: Pdu,
+    session: Session,
+) -> PyResult<PduReply> {
     let py_args = Python::attach(|py| -> PyResult<Vec<Py<PyAny>>> {
         let pdu_py = Py::new(py, pdu)?.into_any();
         let sess_py = Py::new(py, session)?.into_any();
@@ -449,8 +712,6 @@ async fn dispatch_pdu(
             return Ok(PduReply::default_ok());
         }
         bound.extract::<PduReply>().or_else(|_| {
-            // Handler returned something we couldn't cast — leave a
-            // log breadcrumb and fall through to a soft accept.
             tracing::warn!(target: "siphon_smpp",
                 "smpp.on_pdu handler returned a non-PduReply value; defaulting to ESME_ROK");
             Ok(PduReply::default_ok())
@@ -458,18 +719,53 @@ async fn dispatch_pdu(
     })
 }
 
-/// Find the registered handler whose filter matches `command`. The
-/// `@smpp.on_pdu(command)` decorator stores the command in the
-/// handler's `filter` slot; we read it back via `options(py)` since
-/// `siphon::script::HandlerHandle` doesn't expose `filter()`
-/// directly (the filter is what `handlers_for` returns; we pick the
-/// first match that names this command).
-///
-/// `siphon::script::ScriptHandle::handlers_for("smpp.on_pdu")` returns
-/// every registered SMPP PDU handler regardless of command — we still
-/// have to filter by the per-handler command. The kind is the same;
-/// the filter is what differs. The handler list is a snapshot, so
-/// it's cheap to walk it on each dispatch.
+/// Dispatch an `alert_notification` to `@smpp.on_pdu("alert_notification")`.
+/// Notification only — the handler's return value is ignored.
+async fn dispatch_alert(
+    script: &ScriptHandle,
+    alert: AlertNotification,
+    session: Session,
+) -> PyResult<()> {
+    let handler = match pick_pdu_handler(script, "alert_notification")? {
+        Some(h) => h,
+        None => return Ok(()),
+    };
+    let py_args = Python::attach(|py| -> PyResult<Vec<Py<PyAny>>> {
+        let alert_py = Py::new(py, alert)?.into_any();
+        let sess_py = Py::new(py, session)?.into_any();
+        Ok(vec![alert_py, sess_py])
+    })?;
+    let _ = script.call_handler(&handler, py_args).await?;
+    Ok(())
+}
+
+/// Dispatch a session lifecycle event to every matching
+/// `@smpp.on_session("<event>")` handler. Best-effort: handler errors are
+/// logged, never propagated (lifecycle hooks must not break the runtime).
+async fn dispatch_session(script: &ScriptHandle, event: &str, session: Session) {
+    let handlers = pick_session_handlers(script, event);
+    for handler in handlers {
+        let py_args = Python::attach(|py| -> PyResult<Vec<Py<PyAny>>> {
+            Ok(vec![Py::new(py, session.clone())?.into_any()])
+        });
+        let py_args = match py_args {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::error!(target: "siphon_smpp",
+                    event=%event, error=%e, "building on_session args failed");
+                continue;
+            }
+        };
+        if let Err(e) = script.call_handler(&handler, py_args).await {
+            tracing::error!(target: "siphon_smpp",
+                event=%event, error=%e, "@smpp.on_session raised");
+        }
+    }
+}
+
+/// Find the first registered `@smpp.on_pdu` handler whose
+/// `options.command` matches. The decorator stores the command name in
+/// the handler options (the kind filter is shared `"smpp.on_pdu"`).
 fn pick_pdu_handler(
     script: &ScriptHandle,
     command: &str,
@@ -477,22 +773,7 @@ fn pick_pdu_handler(
     let handlers = script.handlers_for("smpp.on_pdu");
     Python::attach(|py| -> PyResult<Option<siphon::script::HandlerHandle>> {
         for h in handlers {
-            // The decorator writes the command name into `filter`;
-            // the script registry exposes it through `kind()` /
-            // `options()`. Until `HandlerHandle::filter()` lands, the
-            // command is mirrored as `options.command`.
-            let opts = h.options(py);
-            let matches = match opts {
-                Some(d) => {
-                    if let Ok(Some(cmd)) = d.get_item("command") {
-                        cmd.extract::<String>().ok().as_deref() == Some(command)
-                    } else {
-                        false
-                    }
-                }
-                None => false,
-            };
-            if matches {
+            if handler_option_eq(&h, py, "command", command) {
                 return Ok(Some(h));
             }
         }
@@ -500,19 +781,63 @@ fn pick_pdu_handler(
     })
 }
 
-/// Look up a `@smpp.on_bind` handler and call it. Handler returns
-/// truthy → bind accepted. Handler missing → reject (closed by
-/// default; the script is the authority on credentials).
+/// All `@smpp.on_session` handlers whose `options.event` matches.
+fn pick_session_handlers(script: &ScriptHandle, event: &str) -> Vec<siphon::script::HandlerHandle> {
+    let handlers = script.handlers_for("smpp.on_session");
+    Python::attach(|py| {
+        handlers
+            .into_iter()
+            .filter(|h| handler_option_eq(h, py, "event", event))
+            .collect()
+    })
+}
+
+/// True when the handler's `options[key]` equals `want`.
+fn handler_option_eq(
+    handler: &siphon::script::HandlerHandle,
+    py: Python<'_>,
+    key: &str,
+    want: &str,
+) -> bool {
+    match handler.options(py) {
+        Some(d) => match d.get_item(key) {
+            Ok(Some(v)) => v.extract::<String>().ok().as_deref() == Some(want),
+            _ => false,
+        },
+        None => false,
+    }
+}
+
+/// Outcome of an `@smpp.on_bind` dispatch.
+struct BindOutcome {
+    accept: bool,
+    status: SmppError,
+    reason: String,
+}
+
+/// Look up a `@smpp.on_bind` handler and call it. The handler returns
+/// `bind.accept()` / `bind.reject(status, reason)` (a `BindResult`), or a
+/// bare truthy/falsy value. No handler, no return, or a raised exception
+/// → reject (closed by default; the script is the authority on
+/// credentials).
 async fn dispatch_bind(
     script: &ScriptHandle,
     system_id: &str,
     password: &str,
     client_addr: &str,
-) -> PyResult<bool> {
+) -> BindOutcome {
+    fn reject(reason: &str) -> BindOutcome {
+        BindOutcome {
+            accept: false,
+            status: SmppError::ESME_RBINDFAIL,
+            reason: reason.to_string(),
+        }
+    }
+
     let handlers = script.handlers_for("smpp.on_bind");
     let handler = match handlers.into_iter().next() {
         Some(h) => h,
-        None => return Ok(false),
+        None => return reject("no @smpp.on_bind handler registered"),
     };
 
     let bind = Bind {
@@ -521,19 +846,69 @@ async fn dispatch_bind(
         client_addr: client_addr.to_string(),
     };
 
-    let py_args = Python::attach(|py| -> PyResult<Vec<Py<PyAny>>> {
+    let py_args = match Python::attach(|py| -> PyResult<Vec<Py<PyAny>>> {
         Ok(vec![Py::new(py, bind)?.into_any()])
-    })?;
+    }) {
+        Ok(a) => a,
+        Err(e) => return reject(&format!("building bind args failed: {e}")),
+    };
 
-    let result = script.call_handler(&handler, py_args).await?;
+    let result = match script.call_handler(&handler, py_args).await {
+        Ok(r) => r,
+        Err(e) => return reject(&format!("@smpp.on_bind raised: {e}")),
+    };
 
-    Python::attach(|py| -> PyResult<bool> {
+    Python::attach(|py| {
         let bound = result.bind(py);
         if bound.is_none() {
-            // No-return ≡ rejection. Forces explicit accept/reject in
-            // scripts, no accidental open binds.
-            return Ok(false);
+            // No explicit return ≡ rejection; forces explicit
+            // accept/reject in scripts, no accidental open binds.
+            return reject("handler returned None");
         }
-        bound.is_truthy()
+        if let Ok(br) = bound.extract::<BindResult>() {
+            return BindOutcome {
+                accept: br.accept,
+                status: br.status,
+                reason: br.reason,
+            };
+        }
+        // Back-compat: a bare truthy/falsy return.
+        match bound.is_truthy() {
+            Ok(true) => BindOutcome {
+                accept: true,
+                status: SmppError::ESME_ROK,
+                reason: String::new(),
+            },
+            _ => reject("handler returned a non-truthy value"),
+        }
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn rate_limiter_paces_to_configured_rate() {
+        // A 100/s limiter starts full (burst of 100), so the first 100
+        // acquires are instant; the 101st must wait ~1 refill interval.
+        let rl = RateLimiter::new(100);
+        let start = Instant::now();
+        for _ in 0..100 {
+            rl.acquire().await;
+        }
+        // Burst drained quickly (well under one refill window).
+        assert!(start.elapsed() < std::time::Duration::from_millis(50));
+
+        // The next token has to be refilled (~10ms at 100/s).
+        let before = Instant::now();
+        rl.acquire().await;
+        assert!(before.elapsed() >= std::time::Duration::from_millis(5));
+    }
+
+    #[test]
+    fn rate_limiter_new_clamps_zero_to_one() {
+        // new(0) must not divide-by-zero; it clamps to 1/s.
+        let _ = RateLimiter::new(0);
+    }
 }

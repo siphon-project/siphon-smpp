@@ -1,0 +1,31 @@
+# Optional autoscaler. SMPP throughput is usually CPU-bound on the
+# script side (routing, persistence), so CPU is a reasonable signal.
+#
+# CAUTION: scaling changes the replica set, and each new replica opens
+# its OWN outbound binds to upstream. Make sure your upstream allows N
+# concurrent binds (and that your routing tolerates messages leaving via
+# any replica) before enabling this. See deploy/k8s/README.md.
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: smsc
+  labels:
+    app: smsc
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: smsc
+  minReplicas: 2
+  maxReplicas: 6
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70
+  behavior:
+    scaleDown:
+      # Don't thrash binds: cool down before removing replicas.
+      stabilizationWindowSeconds: 300
