@@ -46,3 +46,16 @@ jobs:
 
       - name: Leak check
         run: cargo run --release --example leak_check
+
+  harness-smoke:
+    # The load harness is a standalone workspace (smpp34 + tokio + clap only).
+    # Build it and round-trip load through real SMPP framing against its mock
+    # SMSC — the end-to-end SMPP smoke test, no siphon needed.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build + smoke-test the load harness
+        working-directory: harness
+        run: COUNT=5000 WINDOW=32 ./run.sh self-test
