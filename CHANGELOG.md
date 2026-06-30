@@ -10,7 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 ## [0.1.0] — 2026-06-30
 
 First open-source release — an SMPP 3.4 addon for
-[siphon](https://github.com/siphon-project/siphon) with enough surface to build
+[siphon](https://github.com/siphon-project/siphon-sip) with enough surface to build
 a full store-and-forward SMSC in scripts. Built on
 [`smpp34`](https://github.com/Real-Time-Telecom-B-V/smpp34) 1.2.
 

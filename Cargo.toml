@@ -8,7 +8,7 @@ authors = ["SIPhon Contributors"]
 license = "MIT"
 readme = "README.md"
 repository = "https://github.com/siphon-project/siphon-smpp"
-homepage = "https://github.com/siphon-project/siphon"
+homepage = "https://github.com/siphon-project/siphon-sip"
 keywords = ["smpp", "sms", "siphon", "smsc", "telecom"]
 categories = ["network-programming"]
 # Operator-facing assets (deployment templates, Python examples) aren't

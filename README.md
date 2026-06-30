@@ -1,6 +1,6 @@
 # siphon-smpp
 
-**An SMPP 3.4 addon for [siphon](https://github.com/siphon-project/siphon) — build a full SMSC in Python.**
+**An SMPP 3.4 addon for [siphon](https://github.com/siphon-project/siphon-sip) — build a full SMSC in Python.**
 
 <p>
   <a href="https://github.com/siphon-project/siphon-smpp/actions/workflows/ci.yaml">
@@ -33,7 +33,7 @@ touch a socket.
 ## What it is
 
 `siphon-smpp` is a **library**, not a standalone server — it runs as an
-extension inside a [siphon](https://github.com/siphon-project/siphon) binary
+extension inside a [siphon](https://github.com/siphon-project/siphon-sip) binary
 that you build. It provides:
 
 - the `smpp` Python module your scripts `from siphon import smpp` (decorators,
@@ -301,7 +301,7 @@ flat** (Δ 0 over 10 cycles × 200k iterations). Both run in CI.
   **[Real Time Telecom B.V.](https://github.com/Real-Time-Telecom-B-V)** (MIT,
   on [crates.io](https://crates.io/crates/smpp34)). siphon-smpp is a thin,
   scriptable layer over it.
-- **[siphon](https://github.com/siphon-project/siphon)** (`siphon-sip`) — the
+- **[siphon](https://github.com/siphon-project/siphon-sip)** (`siphon-sip`) — the
   host platform. Pinned to a git revision for now (PyO3 0.29; the pin must track
   siphon-sip's, since both link the `python` native library and Cargo allows
   only one version of a `links` crate per graph).
