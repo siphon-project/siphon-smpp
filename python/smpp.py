@@ -25,6 +25,7 @@ free of import-time side effects.
 Send helpers (all async — `await` them):
   Outbound, target a bind by name:
     * submit_via(bind=…, source_addr=…, destination_addr=…, short_message=…, **fields)
+    * submit_multi_via(bind=…, source_addr=…, destinations=[…], short_message=…, **fields)
     * data_via(bind=…, source_addr=…, destination_addr=…, **fields)
     * cancel_via(bind=…, message_id=…, **fields)
     * query_via(bind=…, message_id=…, **fields) -> QueryResp
@@ -80,6 +81,8 @@ def on_pdu(command):
 
     `command` is the PDU command name as a string:
       * "submit_sm"          — MO from an inbound ESME (server side)
+      * "submit_sm_multi"    — one submit to many destinations
+                               (pdu.destinations is the address list)
       * "deliver_sm"         — MT / MO / **DLR** from an outbound bind
       * "data_sm"            — TLV-based message, either direction
       * "cancel_sm"          — cancel request from an inbound ESME

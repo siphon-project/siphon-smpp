@@ -141,12 +141,14 @@ Key points:
   reason is logged on the reject. A bare truthy/falsy return still works. **With
   no handler, binds are rejected — closed by default.**
 - **`@smpp.on_pdu("<command>")`** handlers receive `(pdu, session)` and cover
-  `submit_sm`, `deliver_sm`, `data_sm`, `cancel_sm`, and `alert_notification`
-  (first arg is an `AlertNotification`). The `Pdu` mirrors the SMPP 3.4 fields
-  (`source_addr`, `destination_addr`, `esm_class`, `data_coding`,
-  `short_message` as `bytes`, `is_tpdu`, …). For `deliver_sm`, `pdu.is_dlr`
-  flags a delivery receipt and `pdu.receipt` is the parsed receipt dict
-  (`id`, `stat`, `err`, `submit_date`, `done_date`, `text`, `raw`).
+  `submit_sm`, `submit_sm_multi`, `deliver_sm`, `data_sm`, `cancel_sm`,
+  `query_sm`, `replace_sm`, and `alert_notification` (first arg is an
+  `AlertNotification`). The `Pdu` mirrors the SMPP 3.4 fields (`source_addr`,
+  `destination_addr`, `esm_class`, `data_coding`, `short_message` as `bytes`,
+  `is_tpdu`, …; `submit_sm_multi` carries the address list in `pdu.destinations`).
+  For `deliver_sm`, `pdu.is_dlr` flags a delivery receipt and `pdu.receipt` is the
+  parsed receipt dict (`id`, `stat`, `err`, `submit_date`, `done_date`, `text`,
+  `raw`).
 - **`Session`** carries `kind` (`"esme"` inbound / `"bind"` outbound),
   `session_id`, `system_id`, `client_addr`. `deliver_to` / `data_to` /
   `alert_to` target a bound ESME by `session_id`.
@@ -158,8 +160,8 @@ Key points:
 - **Send helpers** (all `await`): most return an `SmppResp` (`command_status`,
   `message_id`, `ok`); `query_via` returns a `QueryResp` (`message_state`,
   `final_date`, `error_code`).
-  - outbound, by bind name: `submit_via`, `data_via`, `cancel_via`, `query_via`,
-    `replace_via`;
+  - outbound, by bind name: `submit_via`, `submit_multi_via`, `data_via`,
+    `cancel_via`, `query_via`, `replace_via`;
   - inbound, by `session_id`: `deliver_to`, `data_to`, `alert_to`.
 - **Config readouts**: `smpp.config()`, `smpp.bind_address()`, `smpp.binds()`,
   `smpp.routing_rules()`.
@@ -171,9 +173,8 @@ Key points:
 
 ## SMPP operation coverage
 
-`✅ full` · `⏳ stub` (hook present + documented; not yet dispatched because the
-underlying `smpp34` PDU is a stub — scripts written against it light up when it
-lands). Built on `smpp34` 1.2.
+Full SMPP 3.4 operation coverage — every meaningful PDU dispatches to a script
+handler with a sensible default. Built on `smpp34` 1.2.
 
 ### Inbound — an ESME binds to us (server)
 
@@ -182,13 +183,13 @@ lands). Built on `smpp34` 1.2.
 | `bind_transceiver` | `@smpp.on_bind` | reject (closed by default) | ✅ |
 | `bind_transmitter` / `bind_receiver` | — | reject `ESME_RINVSYSID` (transceiver only) | ✅ |
 | `submit_sm` | `@smpp.on_pdu("submit_sm")` | `ESME_ROK` ack | ✅ |
+| `submit_sm_multi` | `@smpp.on_pdu("submit_sm_multi")` (`pdu.destinations`) | reject `ESME_RSYSERR` | ✅ |
 | `data_sm` | `@smpp.on_pdu("data_sm")` | reject `ESME_RSYSERR` | ✅ |
 | `cancel_sm` | `@smpp.on_pdu("cancel_sm")` | reject `ESME_RCANCELFAIL` | ✅ |
 | `query_sm` | `@smpp.on_pdu("query_sm")` → `pdu.reply_query(...)` | reject `ESME_RQUERYFAIL` | ✅ |
 | `replace_sm` | `@smpp.on_pdu("replace_sm")` | reject `ESME_RREPLACEFAIL` | ✅ |
 | `enquire_link` | runtime (keep-alive) | auto-ack | ✅ |
 | `unbind` | runtime + `@smpp.on_session("unbound")` | accept | ✅ |
-| `submit_sm_multi` | — | — | ⏳¹ |
 
 ### Outbound — we bind to a remote SMSC (client)
 
@@ -203,6 +204,7 @@ lands). Built on `smpp34` 1.2.
 | Helper | Direction | Backed by | |
 |---|---|---|---|
 | `submit_via` | → outbound bind | `smpp34` `SMSC::submit_sm` | ✅ |
+| `submit_multi_via` | → outbound bind | `SMSC::send_submit_sm_multi` | ✅ |
 | `data_via` | → outbound bind | `SMSC::send_data_sm` | ✅ |
 | `cancel_via` | → outbound bind | `SMSC::send_cancel_sm` | ✅ |
 | `query_via` | → outbound bind | `SMSC::send_query_sm` | ✅ |
@@ -210,10 +212,6 @@ lands). Built on `smpp34` 1.2.
 | `deliver_to` | → bound ESME (`session_id`) | `ESME::send_deliver_sm` | ✅ |
 | `data_to` | → bound ESME | `ESME::send_data_sm` | ✅ |
 | `alert_to` | → bound ESME | `ESME::send_alert_notification` | ✅ |
-
-¹ **stub** — `submit_sm_multi` (one submit to many destinations) is a stub PDU in
-`smpp34`; siphon-smpp exposes nothing for it yet. Most gateways fan out
-`submit_sm` per destination. It lights up when `smpp34` implements the PDU.
 
 ---
 

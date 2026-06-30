@@ -11,7 +11,8 @@ use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict};
 
 use smpp34::{
-    alert_notification, cancel_sm, deliver_sm, query_sm, replace_sm, submit_sm, SmppError,
+    alert_notification, cancel_sm, deliver_sm, query_sm, replace_sm, submit_sm, submit_sm_multi,
+    DestAddress, SmppError,
 };
 
 // ── Pdu ─────────────────────────────────────────────────────────────────
@@ -58,6 +59,10 @@ pub struct Pdu {
     pub data_coding: u8,
     #[pyo3(get)]
     pub sm_length: u8,
+    /// Destination addresses for `submit_sm_multi` (SME addresses and/or
+    /// distribution-list names, as strings); empty for every other command.
+    #[pyo3(get)]
+    pub destinations: Vec<String>,
     pub short_message: Vec<u8>,
 }
 
@@ -175,6 +180,7 @@ impl Pdu {
             registered_delivery: s.registered_delivery,
             data_coding: s.data_coding,
             sm_length: s.sm_length,
+            destinations: Vec::new(),
             short_message: s.short_message.clone(),
         }
     }
@@ -196,6 +202,7 @@ impl Pdu {
             registered_delivery: d.registered_delivery,
             data_coding: d.data_coding,
             sm_length: d.sm_length,
+            destinations: Vec::new(),
             short_message: d.short_message.clone(),
         }
     }
@@ -221,6 +228,7 @@ impl Pdu {
             registered_delivery: d.registered_delivery,
             data_coding: d.data_coding,
             sm_length: 0,
+            destinations: Vec::new(),
             short_message: Vec::new(),
         }
     }
@@ -244,6 +252,7 @@ impl Pdu {
             registered_delivery: 0,
             data_coding: 0,
             sm_length: 0,
+            destinations: Vec::new(),
             short_message: Vec::new(),
         }
     }
@@ -268,6 +277,7 @@ impl Pdu {
             registered_delivery: 0,
             data_coding: 0,
             sm_length: 0,
+            destinations: Vec::new(),
             short_message: Vec::new(),
         }
     }
@@ -293,7 +303,43 @@ impl Pdu {
             registered_delivery: r.registered_delivery,
             data_coding: 0,
             sm_length: r.sm_length,
+            destinations: Vec::new(),
             short_message: r.short_message.clone(),
+        }
+    }
+
+    /// Build a `Pdu` from an inbound `submit_sm_multi` — one message to many
+    /// destinations. `destinations` lists the SME addresses / distribution-list
+    /// names (as strings); `destination_addr` stays empty (use `destinations`).
+    pub fn from_submit_multi(m: &submit_sm_multi) -> Self {
+        let destinations = m
+            .dest_addresses
+            .iter()
+            .map(|d| match d {
+                DestAddress::Sme {
+                    destination_addr, ..
+                } => destination_addr.clone(),
+                DestAddress::DistributionList { dl_name } => dl_name.clone(),
+            })
+            .collect();
+        Self {
+            command: "submit_sm_multi".into(),
+            message_id: String::new(),
+            service_type: m.service_type.clone(),
+            source_addr_ton: m.source_addr_ton,
+            source_addr_npi: m.source_addr_npi,
+            source_addr: m.source_addr.clone(),
+            dest_addr_ton: 0,
+            dest_addr_npi: 0,
+            destination_addr: String::new(),
+            esm_class: m.esm_class,
+            protocol_id: m.protocol_id,
+            priority_flag: m.priority_flag,
+            registered_delivery: m.registered_delivery,
+            data_coding: m.data_coding,
+            sm_length: m.sm_length,
+            destinations,
+            short_message: m.short_message.clone(),
         }
     }
 }
@@ -715,6 +761,7 @@ mod tests {
             registered_delivery: 0,
             data_coding: 0,
             sm_length: 0,
+            destinations: Vec::new(),
             short_message: Vec::new(),
         }
     }
@@ -835,6 +882,38 @@ mod tests {
         assert_eq!(pdu.command, "query_sm");
         assert_eq!(pdu.message_id, "qid-7");
         assert_eq!(pdu.source_addr, "15550101");
+    }
+
+    #[test]
+    fn pdu_from_submit_multi_maps_destinations() {
+        let m = smpp34::submit_sm_multi::new(
+            1,
+            String::new(),
+            1,
+            1,
+            "15550100".to_string(),
+            vec![
+                smpp34::DestAddress::sme("15550101"),
+                smpp34::DestAddress::sme("15550102"),
+                smpp34::DestAddress::distribution_list("vip"),
+            ],
+            0,
+            0,
+            0,
+            String::new(),
+            String::new(),
+            0,
+            0,
+            0,
+            0,
+            b"hi".to_vec(),
+        );
+        let pdu = Pdu::from_submit_multi(&m);
+        assert_eq!(pdu.command, "submit_sm_multi");
+        assert_eq!(pdu.source_addr, "15550100");
+        // SME addresses + the distribution-list name, all as strings.
+        assert_eq!(pdu.destinations, vec!["15550101", "15550102", "vip"]);
+        assert_eq!(pdu.short_message, b"hi");
     }
 
     #[test]

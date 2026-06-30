@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.1.0] — 2026-06-30
+
+### Added
+
+- **`submit_sm_multi` support** — full operation coverage (no stubs). Inbound
+  `submit_sm_multi` dispatches to `@smpp.on_pdu("submit_sm_multi")` with the
+  destination list on `pdu.destinations` (SME addresses and/or distribution-list
+  names). Outbound `submit_multi_via(bind=…, source_addr=…, destinations=[…],
+  short_message=…)` sends one message to many destinations via
+  `smpp34`'s `SMSC::send_submit_sm_multi`. `Pdu` gains a `destinations` list.
+
 ## [1.0.0] — 2026-06-30
 
 First open-source release — an SMPP 3.4 addon for

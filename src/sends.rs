@@ -18,6 +18,7 @@ use pyo3::prelude::*;
 
 use smpp34::client::SMSC;
 use smpp34::server::ESME;
+use smpp34::DestAddress;
 
 use crate::runtime::{self, RateLimiter, State};
 use std::sync::Arc;
@@ -206,6 +207,97 @@ pub fn submit_via<'py>(
             Ok(r) => Ok(SmppResp::ok_with(r.message_id.unwrap_or_default())),
             Err(e) => Err(PyRuntimeError::new_err(format!(
                 "bind {bind:?} submit_sm failed: {e:?}"
+            ))),
+        }
+    })
+}
+
+/// Submit one message to **many destinations** (`submit_sm_multi`) via the
+/// named outbound bind. `destinations` is a list of SME address strings.
+/// Resolves to an [`SmppResp`] with the SMSC message_id.
+///
+/// NOTE: requires a TX-capable bind (transmitter / transceiver).
+#[allow(clippy::too_many_arguments)]
+#[pyfunction]
+#[pyo3(signature = (
+    *,
+    bind,
+    source_addr,
+    destinations,
+    short_message,
+    source_addr_ton = 1,
+    source_addr_npi = 1,
+    dest_addr_ton = 1,
+    dest_addr_npi = 1,
+    service_type = String::new(),
+    esm_class = 0,
+    protocol_id = 0,
+    priority_flag = 0,
+    schedule_delivery_time = String::new(),
+    validity_period = String::new(),
+    registered_delivery = 0,
+    replace_if_present_flag = 0,
+    data_coding = 0,
+    sm_default_msg_id = 0,
+))]
+pub fn submit_multi_via<'py>(
+    py: Python<'py>,
+    bind: String,
+    source_addr: String,
+    destinations: Vec<String>,
+    short_message: Vec<u8>,
+    source_addr_ton: u8,
+    source_addr_npi: u8,
+    dest_addr_ton: u8,
+    dest_addr_npi: u8,
+    service_type: String,
+    esm_class: u8,
+    protocol_id: u8,
+    priority_flag: u8,
+    schedule_delivery_time: String,
+    validity_period: String,
+    registered_delivery: u8,
+    replace_if_present_flag: u8,
+    data_coding: u8,
+    sm_default_msg_id: u8,
+) -> PyResult<Bound<'py, PyAny>> {
+    let state = require_state()?;
+    let dest_addresses: Vec<DestAddress> = destinations
+        .into_iter()
+        .map(|destination_addr| DestAddress::Sme {
+            dest_addr_ton,
+            dest_addr_npi,
+            destination_addr,
+        })
+        .collect();
+    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+        let (smsc, throttle) = bind_handle(&state, &bind).await?;
+        if let Some(limiter) = throttle {
+            limiter.acquire().await;
+        }
+        let resp = smsc
+            .send_submit_sm_multi(
+                service_type,
+                source_addr_ton,
+                source_addr_npi,
+                source_addr,
+                dest_addresses,
+                esm_class,
+                protocol_id,
+                priority_flag,
+                schedule_delivery_time,
+                validity_period,
+                registered_delivery,
+                replace_if_present_flag,
+                data_coding,
+                sm_default_msg_id,
+                short_message,
+            )
+            .await;
+        match resp {
+            Ok(r) => Ok(SmppResp::ok_with(r.message_id.unwrap_or_default())),
+            Err(e) => Err(PyRuntimeError::new_err(format!(
+                "bind {bind:?} submit_sm_multi failed: {e:?}"
             ))),
         }
     })
