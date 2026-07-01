@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.0] — 2026-07-01
+
+### Added
+
+- **Inbound throttling** — a per-ESME-session ingress rate cap, the mirror of a
+  bind's outbound `max_msg_per_sec`. `server.max_msg_per_sec` (0 = unlimited)
+  gives each bound ESME its own token bucket, so one busy ESME can't starve
+  another; inbound `submit_sm` / `data_sm` / `submit_sm_multi` are gated before
+  dispatch. `server.throttle_action` selects the over-rate behaviour: `pace`
+  (default — delay the response, backpressuring through the ESME's window) or
+  `reject` (answer immediately with `ESME_RTHROTTLED`). Both are overridable
+  from the environment (`SMPP_SERVER_MAX_MPS`, `SMPP_SERVER_THROTTLE_ACTION`)
+  and exposed to scripts via the `_config` server dict.
+
 ## [1.1.0] — 2026-06-30
 
 ### Added
