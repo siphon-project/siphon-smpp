@@ -11,6 +11,10 @@
   <img src="https://img.shields.io/badge/SMPP-3.4-blue" alt="SMPP 3.4">
 </p>
 
+📖 **Documentation: [smpp.siphon-sip.org](https://smpp.siphon-sip.org)** — concepts,
+quickstart, configuration, the SMSC cookbook, the script API, and Kubernetes /
+scaling guides.
+
 `siphon-smpp` plugs an `smpp` namespace into a siphon binary so your scripts can
 speak **SMPP** — binds, `submit_sm`, `deliver_sm`, delivery receipts, `data_sm`,
 `cancel_sm`, `alert_notification` — with the same hot-reloaded, decorator-style
