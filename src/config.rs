@@ -70,7 +70,46 @@ pub struct ServerConfig {
     #[serde(default = "default_response")]
     pub response_timer_ms: u64,
 
+    /// Optional inbound throughput cap (msg/s) applied **per bound ESME
+    /// session** — the ingress mirror of a bind's `max_msg_per_sec`. Each
+    /// session gets its own token bucket, so one busy ESME can't starve
+    /// another. 0 = unlimited. See [`throttle_action`](Self::throttle_action)
+    /// for what happens when the cap is hit.
+    #[serde(default)]
+    pub max_msg_per_sec: u32,
+
+    /// What to do with an inbound submit that exceeds
+    /// [`max_msg_per_sec`](Self::max_msg_per_sec): `pace` (delay the
+    /// `*_resp`, the default) or `reject` (answer immediately with
+    /// `ESME_RTHROTTLED`). No effect when `max_msg_per_sec` is 0.
+    #[serde(default)]
+    pub throttle_action: ThrottleAction,
+
     pub tls: Option<TlsConfig>,
+}
+
+/// Behaviour when a bound ESME exceeds `server.max_msg_per_sec`.
+#[derive(Debug, Deserialize, Clone, Copy, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ThrottleAction {
+    /// Delay the response until a token frees, backpressuring the ESME
+    /// through its outstanding-PDU window. A speed limit, not an error.
+    #[default]
+    Pace,
+    /// Answer the over-rate submit immediately with `ESME_RTHROTTLED`
+    /// (0x58); the ESME is expected to back off and retry.
+    Reject,
+}
+
+impl ThrottleAction {
+    /// Lowercase wire/label form (`"pace"` / `"reject"`), used for the
+    /// script-visible `_config` dict and log lines.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ThrottleAction::Pace => "pace",
+            ThrottleAction::Reject => "reject",
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -215,6 +254,30 @@ impl SmppConfig {
                 .collect();
             tracing::info!(chain = ?chain, "smpp: default_chain overridden by SMPP_DEFAULT_CHAIN");
             cfg.routing.default_chain = chain;
+        }
+        // Inbound per-session throughput cap; mirrors the per-bind
+        // SMPP_BIND_<NAME>_MAX_MPS override so the ingress rate can be
+        // tuned from the environment without editing the YAML.
+        if let Ok(raw) = std::env::var("SMPP_SERVER_MAX_MPS") {
+            match raw.trim().parse::<u32>() {
+                Ok(mps) => {
+                    tracing::info!(
+                        max_msg_per_sec = mps,
+                        "smpp: server.max_msg_per_sec overridden by SMPP_SERVER_MAX_MPS"
+                    );
+                    cfg.server.max_msg_per_sec = mps;
+                }
+                Err(e) => tracing::warn!(value = %raw, error = %e,
+                    "smpp: ignoring invalid SMPP_SERVER_MAX_MPS"),
+            }
+        }
+        if let Ok(raw) = std::env::var("SMPP_SERVER_THROTTLE_ACTION") {
+            match raw.trim().to_lowercase().as_str() {
+                "pace" => cfg.server.throttle_action = ThrottleAction::Pace,
+                "reject" => cfg.server.throttle_action = ThrottleAction::Reject,
+                other => tracing::warn!(value = %other,
+                    "smpp: ignoring invalid SMPP_SERVER_THROTTLE_ACTION (want pace|reject)"),
+            }
         }
         Ok(cfg)
     }
@@ -364,6 +427,8 @@ server:
   port: 9999
   session_init_timer_ms: 1000
   enquire_link_timer_ms: 15000
+  max_msg_per_sec: 200
+  throttle_action: reject
 
 binds:
   - name: alpha
@@ -400,6 +465,8 @@ routing:
         assert_eq!(cfg.server.port, Some(9999));
         assert_eq!(cfg.server.session_init_timer_ms, 1000);
         assert_eq!(cfg.server.enquire_link_timer_ms, 15000);
+        assert_eq!(cfg.server.max_msg_per_sec, 200);
+        assert_eq!(cfg.server.throttle_action, ThrottleAction::Reject);
         // server timers not set in YAML fall back to defaults
         assert_eq!(cfg.server.inactivity_timer_ms, default_inactivity());
         assert_eq!(cfg.server.response_timer_ms, default_response());
@@ -479,6 +546,9 @@ routing:
         assert_eq!(cfg.server.enquire_link_timer_ms, default_enquire_link());
         assert_eq!(cfg.server.inactivity_timer_ms, default_inactivity());
         assert_eq!(cfg.server.response_timer_ms, default_response());
+        // Inbound throttle defaults to unlimited (0) / pace when omitted.
+        assert_eq!(cfg.server.max_msg_per_sec, 0);
+        assert_eq!(cfg.server.throttle_action, ThrottleAction::Pace);
     }
 
     #[test]
@@ -713,5 +783,62 @@ binds:
         };
         let msg = missing.to_string();
         assert!(msg.contains("SMPP_BIND_ALPHA_PASSWORD"), "got: {msg}");
+    }
+
+    #[test]
+    fn server_max_mps_env_overrides_yaml() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // YAML sets 10; the env override must win with 500.
+        let path = std::env::temp_dir().join("siphon_smpp_server_max_mps_test.yaml");
+        std::fs::write(&path, "server:\n  port: 2775\n  max_msg_per_sec: 10\n").unwrap();
+        let _g = EnvGuard::set(&[("SMPP_SERVER_MAX_MPS", "500")]);
+
+        let cfg = SmppConfig::from_file(&path).expect("loads");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(cfg.server.max_msg_per_sec, 500);
+    }
+
+    #[test]
+    fn server_max_mps_env_invalid_is_ignored() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // A non-numeric override is warned-and-skipped; the YAML value stands.
+        let path = std::env::temp_dir().join("siphon_smpp_server_max_mps_bad_test.yaml");
+        std::fs::write(&path, "server:\n  port: 2775\n  max_msg_per_sec: 42\n").unwrap();
+        let _g = EnvGuard::set(&[("SMPP_SERVER_MAX_MPS", "not-a-number")]);
+
+        let cfg = SmppConfig::from_file(&path).expect("loads");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(cfg.server.max_msg_per_sec, 42);
+    }
+
+    #[test]
+    fn server_throttle_action_env_overrides_yaml() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // YAML omits the action (defaults to pace); env forces reject.
+        let path = std::env::temp_dir().join("siphon_smpp_throttle_action_test.yaml");
+        std::fs::write(&path, "server:\n  port: 2775\n  max_msg_per_sec: 10\n").unwrap();
+        let _g = EnvGuard::set(&[("SMPP_SERVER_THROTTLE_ACTION", "REJECT")]);
+
+        let cfg = SmppConfig::from_file(&path).expect("loads");
+        std::fs::remove_file(&path).ok();
+
+        // Case-insensitive.
+        assert_eq!(cfg.server.throttle_action, ThrottleAction::Reject);
+    }
+
+    #[test]
+    fn server_throttle_action_env_invalid_is_ignored() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // A bad action leaves the YAML value (reject) in place.
+        let path = std::env::temp_dir().join("siphon_smpp_throttle_action_bad_test.yaml");
+        std::fs::write(&path, "server:\n  port: 2775\n  throttle_action: reject\n").unwrap();
+        let _g = EnvGuard::set(&[("SMPP_SERVER_THROTTLE_ACTION", "nonsense")]);
+
+        let cfg = SmppConfig::from_file(&path).expect("loads");
+        std::fs::remove_file(&path).ok();
+
+        assert_eq!(cfg.server.throttle_action, ThrottleAction::Reject);
     }
 }

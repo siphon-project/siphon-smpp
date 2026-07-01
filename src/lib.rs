@@ -44,8 +44,10 @@
 //!
 //! Rust handles: TCP framing, bind/enquire_link/inactivity timers,
 //! sequence-number windowing, PDU codec, retransmission of unacked
-//! deliver_sm. Python handles: routing decisions, ESME credential
-//! verification, message persistence/queueing, throttling policy.
+//! deliver_sm, and rate limiting in both directions (`max_msg_per_sec`
+//! per outbound bind and per inbound ESME session). Python handles:
+//! routing decisions, ESME credential verification, message
+//! persistence/queueing, throttling *policy*.
 
 pub mod config;
 pub mod install;

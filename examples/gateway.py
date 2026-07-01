@@ -17,7 +17,8 @@ What the CRATE owns (you don't write this):
   * TCP framing + the SMPP 3.4 PDU codec (via smpp34)
   * bind / enquire_link / inactivity timers, sequence windowing
   * outbound bind supervision: connect, bind, reconnect-with-backoff
-  * per-bind outbound throttling (max_msg_per_sec)
+  * per-bind outbound throttling (max_msg_per_sec) and per-session
+    inbound throttling (server.max_msg_per_sec)
   * dispatching each PDU into the handlers below
 
 What YOUR SCRIPT owns (this file):

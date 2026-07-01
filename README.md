@@ -20,7 +20,7 @@ timer and codec byte in Rust.
 
 The boundary: **Rust owns the wire** (TCP/TLS framing, the SMPP codec,
 sequence-number windowing, keep-alive/response timers, reconnect-with-backoff,
-outbound throttling); **Python owns policy** (which binds to accept and *why*,
+inbound + outbound throttling); **Python owns policy** (which binds to accept and *why*,
 where to route, how to correlate a DLR, what status to return). Scripts never
 touch a socket.
 
@@ -52,7 +52,11 @@ It speaks **two directions**, both described in terms of *binds*:
   (`server.bind_address`/`server.port`). They `bind_transceiver`, authorised by
   `@smpp.on_bind`, then send us `submit_sm` / `data_sm` / `cancel_sm`; we can
   `deliver_sm` / `data_sm` / `alert_notification` back to them by `session_id`.
-  `bind_transmitter` / `bind_receiver` are rejected — transceiver only.
+  `bind_transmitter` / `bind_receiver` are rejected — transceiver only. Inbound
+  message PDUs are rate-limited by an optional per-session
+  `server.max_msg_per_sec` token bucket — the ingress mirror of a bind's
+  outbound cap — either pacing the response or rejecting with `ESME_RTHROTTLED`
+  per `server.throttle_action`.
 - **Outbound binds** — siphon-smpp binds out as an ESME to remote SMSCs /
   aggregators (the `binds:` config list). We `submit_sm` / `data_sm` /
   `cancel_sm` out via `*_via(bind="<name>", …)`; they send us `deliver_sm`
@@ -60,6 +64,14 @@ It speaks **two directions**, both described in terms of *binds*:
   bind is supervised: connect, hold, and on disconnect reconnect with
   exponential backoff (capped at 60s, reset after a healthy session), paced by
   an optional per-bind `max_msg_per_sec` token bucket.
+
+Throttling is symmetric: outbound sends are paced per bind (`max_msg_per_sec`
+on each `binds:` entry), inbound submits are rate-limited per ESME session
+(`server.max_msg_per_sec`). Outbound is always a pure speed limit (delay, never
+reject). Inbound picks its over-rate behaviour with `server.throttle_action`:
+`pace` (default — delay the response, backpressuring through the ESME's window)
+or `reject` (answer immediately with `ESME_RTHROTTLED`, the SMPP-native
+back-off signal).
 
 ---
 
@@ -80,7 +92,7 @@ What the **crate** gives you vs. what your **script** owns:
 | bind / enquire_link / inactivity / response timers | routing (which bind a destination takes) |
 | sequence windowing, PDU dispatch | DLR correlation + routing back to the ESME |
 | outbound bind supervision + reconnect | store-and-forward queue, retries |
-| per-bind outbound throttling | throttling *policy*, persistence |
+| per-bind outbound + per-session inbound throttling | throttling *policy*, persistence |
 
 Rule of thumb: **on the wire or on a clock → Rust; a decision → Python.**
 
@@ -235,6 +247,8 @@ server:                              # inbound listener (ESMEs bind to us)
   enquire_link_timer_ms: 30000       # default
   inactivity_timer_ms: 300000        # default (5 min)
   response_timer_ms: 30000           # default
+  max_msg_per_sec: 200               # inbound throttle, per ESME session; 0 = unlimited
+  throttle_action: pace              # over-rate: pace (default) | reject (ESME_RTHROTTLED)
   # tls: { cert_path: …, key_path: …, ca_path: … }
 
 binds:                               # outbound binds (we bind to remote SMSCs)
@@ -267,7 +281,10 @@ SMPP_BIND_AGGREGATOR_EU_MAX_MPS=100        # optional, 0 = unlimited
 
 The `<NAME>` segment is uppercased in the env var and lowercased to form the
 bind name; names must not contain underscores. `SMPP_DEFAULT_CHAIN` overrides
-`routing.default_chain`. Env-var binds merge with any declared in the file. See
+`routing.default_chain`; `SMPP_SERVER_MAX_MPS` and
+`SMPP_SERVER_THROTTLE_ACTION` override `server.max_msg_per_sec` and
+`server.throttle_action` (the inbound throttle). Env-var binds merge with any
+declared in the file. See
 [`deploy/smpp.example.yaml`](deploy/smpp.example.yaml) for an annotated config.
 
 ---
