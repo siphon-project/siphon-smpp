@@ -210,6 +210,41 @@ Read (never write) the loaded [configuration](configuration.md):
 | `smpp.binds()` | The list of configured outbound binds (`[{name, host, …}]`). |
 | `smpp.routing_rules()` | `(default_chain, rules)` for your routing logic. |
 
+## Testing your scripts
+
+You can unit-test SMPP scripts without a running SMSC. The
+[`siphon-sip` SDK](https://pypi.org/project/siphon-sip/) (`pip install
+siphon-sip`) mocks the `smpp` namespace — the same decorators, PDU objects, and
+send helpers described above — and ships an `SmppTestHarness` that dispatches
+binds, PDUs, and lifecycle events into your handlers so you can assert on the
+replies and on what your script sent back:
+
+```python
+from siphon_sdk.smpp_testing import SmppTestHarness
+
+def test_gateway_authorises_and_submits():
+    harness = SmppTestHarness()
+    harness.load_script("examples/gateway.py")
+
+    # bind_transceiver → @smpp.on_bind
+    assert harness.bind("esme1", password="s3cret")
+
+    # submit_sm → @smpp.on_pdu("submit_sm")
+    reply = harness.submit_sm(source_addr="15550100",
+                              destination_addr="15550101",
+                              short_message=b"hi")
+    assert reply.ok
+
+    # a DLR delivered on an outbound bind is routed back to the ESME
+    harness.deliver_sm(esm_class=0x04,
+                       short_message=b"id:msg-1 stat:DELIVRD err:000")
+    assert harness.sent[0][0] == "deliver_to"
+```
+
+The mock also gives IDEs and LLMs the full type hints and docstrings for the
+namespace, which helps when authoring scripts. The mock tracks this crate's
+runtime surface — CI (`scripts/check_sdk_parity.py`) fails if they drift.
+
 ## Hot reload, restated
 
 Handlers are looked up per-PDU, so editing your script (and letting SIPhon reload

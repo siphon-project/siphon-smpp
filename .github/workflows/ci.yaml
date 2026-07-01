@@ -59,3 +59,24 @@ jobs:
       - name: Build + smoke-test the load harness
         working-directory: harness
         run: COUNT=5000 WINDOW=32 ./run.sh self-test
+
+  sdk-parity:
+    # The siphon-sip SDK ships a mock of this crate's `smpp` script namespace so
+    # SMPP scripts can be unit-tested and authored with type hints (see
+    # docs/script-api.md → "Testing your scripts"). This job fails if that mock
+    # has drifted from the runtime surface. It installs the SDK from siphon-sip
+    # `main`, so it goes green once the matching siphon-sip mock change is merged.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+      - name: Install the siphon-sip SDK (the mock under test)
+        env:
+          # hatch-vcs derives the version from git tags; a shallow pip clone may
+          # lack them, so pin a throwaway version for this check-only install.
+          SETUPTOOLS_SCM_PRETEND_VERSION: "0.0.0"
+        run: pip install "siphon-sip @ git+https://github.com/siphon-project/siphon-sip@main#subdirectory=sdk"
+      - name: Check SDK mock parity
+        run: python scripts/check_sdk_parity.py
