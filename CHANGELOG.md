@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.2.1] — 2026-07-01
+
 ### Added
 
 - **SDK testing support for SMPP scripts** — the `siphon-sip` SDK now mocks the
