@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **SDK testing support for SMPP scripts** — the `siphon-sip` SDK now mocks the
+  `smpp` namespace, so scripts can be unit-tested with `SmppTestHarness` and
+  authored with full type hints/docstrings via `pip install siphon-sip` (no
+  running SMSC). Documented under **Testing your scripts** in the script API
+  reference. A CI parity check (`scripts/check_sdk_parity.py`) fails the build if
+  the mock drifts from the runtime `smpp` surface.
+
 ## [1.2.0] — 2026-07-01
 
 ### Added
