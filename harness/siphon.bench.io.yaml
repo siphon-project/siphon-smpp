@@ -1,0 +1,27 @@
+# siphon.bench.io.yaml — like siphon.bench.yaml, but points at the I/O-simulating
+# handler (bench_echo_io.py) for the diagnostic in bench_multi.sh. See that file.
+
+listen:
+  tcp:
+    - "127.0.0.1:15060"   # unused throwaway SIP listener (core requires one)
+
+domain:
+  local:
+    - "127.0.0.1"
+
+script:
+  path: "harness/bench_echo_io.py"
+  reload: sighup
+
+registrar:
+  backend: memory
+
+auth:
+  realm: "bench.local"
+
+log:
+  level: warn
+  format: pretty
+
+extensions:
+  smpp: harness/smpp.yaml

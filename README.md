@@ -274,10 +274,14 @@ bind name; names must not contain underscores. `SMPP_DEFAULT_CHAIN` overrides
 
 ## Performance
 
-The live runtime is socket- and Python-bound, and the SMPP wire codec is benched
-in `smpp34`'s own suite — so siphon-smpp's benches
-([`benches/codec.rs`](benches/codec.rs)) cover the per-message Rust work this
-crate adds on top. Indicative single-core numbers (`cargo bench`):
+Two layers, benched separately: the per-message Rust work this crate adds
+(codec, below), and the end-to-end SMSC path under load (the [`harness/`](harness/)).
+
+### Codec — per-message Rust work (`cargo bench`)
+
+The SMPP wire codec itself is benched in `smpp34`'s own suite; siphon-smpp's
+benches ([`benches/codec.rs`](benches/codec.rs)) cover the work this crate adds on
+top. Indicative single-core numbers:
 
 | Path | Time |
 |---|---|
@@ -289,6 +293,55 @@ crate adds on top. Indicative single-core numbers (`cargo bench`):
 A counting-allocator [leak check](examples/leak_check.rs)
 (`./scripts/mem_leak_test.sh`) hammers those paths and asserts **live bytes stay
 flat** (Δ 0 over 10 cycles × 200k iterations). Both run in CI.
+
+### End-to-end — live siphon + Python dispatch (the [`harness/`](harness/))
+
+The harness floods `submit_sm` at a real `siphon --features smpp` running
+[`bench_echo.py`](harness/bench_echo.py) (accept-bind + ack-`submit_sm`, no I/O),
+so it measures the whole path — bind → `smpp34` decode → Python handler dispatch →
+`submit_sm_resp` — and nothing else. Numbers below are illustrative (loopback, a
+24-core developer laptop, in-memory registrar, siphon-smpp v1.1.0 via siphon-bin),
+not lab-grade — reproduce your own with the scripts.
+
+**Single bind** — `./harness/bench.sh` (100k `submit_sm`, sweeping the SMPP window):
+
+| window | submit_sm/s | p50 | p90 | p99 | p999 |
+|---:|---:|---:|---:|---:|---:|
+| 1   | 7,505  | 0.10 ms | 0.23 ms | 0.29 ms | 0.44 ms |
+| 8   | 11,007 | 0.67 ms | 1.09 ms | 1.56 ms | 2.07 ms |
+| 32  | 10,910 | 2.91 ms | 3.44 ms | 4.07 ms | 5.10 ms |
+| 64  | 11,225 | 5.69 ms | 6.56 ms | 7.74 ms | 9.60 ms |
+| 128 | 11,383 | 11.30 ms | 12.80 ms | 14.15 ms | 17.42 ms |
+| 256 | 10,936 | 23.57 ms | 26.42 ms | 28.87 ms | 30.28 ms |
+| 512 | 11,063 | 46.70 ms | 52.20 ms | 56.43 ms | 58.46 ms |
+
+**~11k `submit_sm/s` through one bind at sub-millisecond p50 (0.10 ms at window 1).**
+Throughput is flat across the window, so latency past the knee is pure queueing
+(Little's law: p50 ≈ window ÷ throughput).
+
+**Aggregate** — `./harness/bench_multi.sh` (N parallel binds, window 64):
+
+| binds | aggregate submit_sm/s | per-bind |
+|---:|---:|---:|
+| 1  | 6,808  | 6,808 |
+| 4  | 6,909  | 1,727 |
+| 8  | 7,530  | 941 |
+| 16 | 10,912 | 682 |
+| 24 | 11,595 | 483 |
+
+Aggregate barely moves as binds are added, with the host mostly idle — the ceiling
+is the **per-message Python handler body**, not the SMPP path (the same harness
+against a Rust-only mock SMSC does ~138k/s) and not I/O (the echo touches none).
+That handler runs in CPython, and on a standard (GIL) interpreter it serializes to
+roughly one core's throughput no matter how many binds or cores you have.
+
+Two ways past it: keep per-message handler work minimal (push heavy lifting into
+Rust), and — the real unlock — run siphon against **free-threaded CPython**
+(3.13t / 3.14t), which this whole stack (`smpp34` included) already targets. There
+the handler body runs on every core, so aggregate scales with binds instead of
+flatlining: early 3.14t runs here lifted it close to an order of magnitude (to
+~10⁵ `submit_sm/s`) on the same box. Point `bench_multi.sh` at a free-threaded
+build to measure your own.
 
 ---
 
