@@ -62,6 +62,52 @@ Swap `examples/echo.py` for `examples/gateway.py` (with outbound binds + a mock
 upstream `serve`) to load-test the full store-and-forward path including DLR
 correlation.
 
+### One-shot: `bench.sh`
+
+`bench.sh` automates the whole thing — start siphon, wait for the listener,
+sweep a range of SMPP windows, and print a markdown table for the top-level
+README. It uses `bench_echo.py` (a logging-free variant of `echo.py` with a
+constant `message_id`) and `siphon.bench.yaml` (a minimal SMPP-only siphon
+config with `log.level: warn`), so the numbers reflect the dispatch path, not
+log I/O.
+
+```bash
+# Option A — you already have an SMPP-enabled siphon binary:
+SIPHON_BIN=/path/to/siphon ./bench.sh
+
+# Option B — build it from a siphon-sip checkout (needs PR #20 merged):
+SIPHON_SIP_DIR=~/workspace/siphon-sip ./bench.sh
+
+# Knobs: COUNT=2000000 WINDOWS="32 128 512" ./bench.sh
+```
+
+It measures the full path — TCP accept → `smpp34` decode → `@smpp.on_pdu`
+dispatch → reply → `submit_sm_resp` — i.e. the real siphon + smpp number, not
+the driver/loopback ceiling that `self-test` reports. (`siphon-bin --features
+smpp` shipped in siphon-sip
+[#20](https://github.com/siphon-project/siphon-sip/pull/20).)
+
+### Aggregate across binds: `bench_multi.sh`
+
+`bench.sh` drives one bind (the per-bind ceiling + latency curve). A real SMSC
+serves many ESMEs at once — `bench_multi.sh` launches N parallel binds against
+one siphon and reports the aggregate `submit_sm/s` (sum of each bind's sustained
+rate), sweeping the bind count:
+
+```bash
+SIPHON_BIN=/path/to/siphon BINDLIST="1 4 8 16 24" ./bench_multi.sh
+```
+
+On a standard (GIL) CPython build, aggregate barely rises with binds: the
+per-message Python handler body serializes on the GIL. Build siphon against a
+**free-threaded** interpreter (`PYO3_PYTHON=python3.14t cargo build …`, run with
+that `libpython3.14t` on `LD_LIBRARY_PATH`) and the same sweep scales across
+cores — near an order of magnitude here (free-threaded CPython support is still
+stabilising, so treat it as experimental). `bench_echo_io.py` +
+`siphon.bench.io.yaml` are a diagnostic variant whose handler `await`s a
+simulated I/O roundtrip, to show the ceiling is CPU-under-GIL, not event-loop
+concurrency.
+
 ## `smpp-load` reference
 
 ```

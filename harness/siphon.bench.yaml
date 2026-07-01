@@ -1,0 +1,38 @@
+# siphon.bench.yaml — minimal SMPP-only siphon config for the load harness.
+#
+# Wires the silent bench script + the smpp addon's inbound listener and turns
+# logging down, so the measurement reflects dispatch cost rather than log I/O.
+# Paths are relative to the repo root — harness/bench.sh runs siphon from there.
+#
+# NOTE: siphon is SIP-first, so the core still wants a `listen`/`domain` even
+# for an SMPP-only role; the SIP listener below is a throwaway on a high port.
+# The SMPP listener (the thing under test) is configured in harness/smpp.yaml,
+# referenced via the `extensions.smpp` path. If siphon-bin's final extension
+# wiring (siphon-sip #20) differs, adjust the `extensions:` block to match.
+
+listen:
+  tcp:
+    - "127.0.0.1:15060"   # unused throwaway SIP listener (core requires one)
+
+domain:
+  local:
+    - "127.0.0.1"
+
+script:
+  path: "harness/bench_echo.py"
+  reload: sighup
+
+registrar:
+  backend: memory
+
+auth:
+  realm: "bench.local"
+
+log:
+  level: warn            # silence per-request logs — measure dispatch, not logging
+  format: pretty
+
+# Extension-owned config — siphon-core passes this path through to the smpp
+# addon, which reads its inbound listener (0.0.0.0:2775) from harness/smpp.yaml.
+extensions:
+  smpp: harness/smpp.yaml
