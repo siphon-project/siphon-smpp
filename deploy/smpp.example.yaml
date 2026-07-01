@@ -16,6 +16,7 @@ server:
   enquire_link_timer_ms: 30000
   inactivity_timer_ms: 300000
   response_timer_ms: 30000
+  max_msg_per_sec: 200         # inbound throttle, per ESME session (0 = unlimited)
 
 binds:
   # Outbound binds (we bind to upstream SMSCs / aggregators).
@@ -49,3 +50,6 @@ routing:
 #   SMPP_BIND_GAMMA_SYSTEM_ID=gamma_esme
 #   SMPP_BIND_GAMMA_PASSWORD=...
 #   SMPP_BIND_GAMMA_MAX_MPS=100
+#
+# The inbound throttle can likewise be overridden from the environment:
+#   SMPP_SERVER_MAX_MPS=500   # overrides server.max_msg_per_sec

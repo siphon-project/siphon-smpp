@@ -112,6 +112,7 @@ fn build_config_dict<'py>(py: Python<'py>, cfg: &SmppConfig) -> PyResult<Bound<'
     server.set_item("enquire_link_timer_ms", cfg.server.enquire_link_timer_ms)?;
     server.set_item("inactivity_timer_ms", cfg.server.inactivity_timer_ms)?;
     server.set_item("response_timer_ms", cfg.server.response_timer_ms)?;
+    server.set_item("max_msg_per_sec", cfg.server.max_msg_per_sec)?;
     dict.set_item("server", server)?;
 
     // Outbound binds

@@ -121,8 +121,8 @@ async fn esme_handle(state: &Arc<State>, session_id: &str) -> PyResult<Arc<ESME>
     let esmes = state.esmes.lock().await;
     esmes
         .iter()
-        .find(|e| e.session_id == session_id)
-        .cloned()
+        .find(|e| e.esme.session_id == session_id)
+        .map(|e| e.esme.clone())
         .ok_or_else(|| PyKeyError::new_err(format!("esme session {session_id:?} not bound")))
 }
 

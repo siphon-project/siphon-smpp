@@ -15,6 +15,9 @@
 //!   *with an explicit status + reason*. `submit_sm`, `data_sm` and
 //!   `cancel_sm` dispatch into `@smpp.on_pdu(...)`. Bound ESME sessions
 //!   are tracked so `smpp.deliver_to(session_id=…)` can MT back to them.
+//!   Inbound message PDUs (`submit_sm` / `data_sm` / `submit_sm_multi`)
+//!   are paced per session by `server.max_msg_per_sec` — the ingress
+//!   mirror of a bind's outbound `max_msg_per_sec` throttle.
 //!
 //! Both listeners read the script handler table from the
 //! [`siphon::script::ScriptHandle`] on every dispatch (via
@@ -46,10 +49,12 @@ use crate::{config::BindConfig, SmppConfig};
 
 pub(crate) struct State {
     pub binds: Mutex<Vec<BindSession>>,
-    /// Bound inbound ESME sessions, behind `Arc` so a send helper can
-    /// clone the handle out, drop the lock, and await without blocking
-    /// other sessions behind the mutex.
-    pub esmes: Mutex<Vec<Arc<ESME>>>,
+    /// Bound inbound ESME sessions.
+    pub esmes: Mutex<Vec<EsmeSession>>,
+    /// Inbound throughput cap (msg/s) applied per bound ESME session;
+    /// 0 = unlimited. Read once at spawn from `server.max_msg_per_sec`
+    /// and used to build each session's limiter in `on_esme_bound`.
+    pub inbound_max_mps: u32,
     pub script: ScriptHandle,
 }
 
@@ -64,6 +69,17 @@ pub(crate) struct BindSession {
     pub throttle: Option<Arc<RateLimiter>>,
 }
 
+/// A bound inbound ESME session (an ESME that connected to *us*).
+pub(crate) struct EsmeSession {
+    /// `Arc` so a send helper can clone the handle out, drop the lock,
+    /// and await without blocking other sessions behind the mutex.
+    pub esme: Arc<ESME>,
+    /// Per-session inbound rate limiter (`server.max_msg_per_sec`);
+    /// `None` when unlimited. Paces inbound `submit_sm` / `data_sm` /
+    /// `submit_sm_multi` — the ingress mirror of `BindSession::throttle`.
+    pub throttle: Option<Arc<RateLimiter>>,
+}
+
 pub(crate) static STATE: OnceLock<Arc<State>> = OnceLock::new();
 
 /// Public accessor used by the send helpers in [`crate::sends`].
@@ -73,11 +89,13 @@ pub(crate) fn state() -> Option<Arc<State>> {
 
 // ── Rate limiter (token bucket) ─────────────────────────────────────────
 
-/// Simple async token-bucket, one per bind, used to honour
-/// `max_msg_per_sec` on outbound sends. Paces (awaits) rather than
-/// rejecting — an aggregator's throughput cap is a speed limit, not an
-/// error. Capacity is one second's worth of tokens, so short bursts pass
-/// through and sustained load settles at the configured rate.
+/// Simple async token-bucket used to honour `max_msg_per_sec` in both
+/// directions: one per outbound bind (paces `submit_via` etc.) and one
+/// per inbound ESME session (paces inbound `submit_sm` / `data_sm` /
+/// `submit_sm_multi`). Paces (awaits) rather than rejecting — a
+/// throughput cap is a speed limit, not an error. Capacity is one
+/// second's worth of tokens, so short bursts pass through and sustained
+/// load settles at the configured rate.
 pub(crate) struct RateLimiter {
     inner: Mutex<Bucket>,
 }
@@ -131,6 +149,7 @@ pub fn spawn(cfg: SmppConfig, script: ScriptHandle) {
     let state = Arc::new(State {
         binds: Mutex::new(Vec::new()),
         esmes: Mutex::new(Vec::new()),
+        inbound_max_mps: cfg.server.max_msg_per_sec,
         script: script.clone(),
     });
     if STATE.set(state.clone()).is_err() {
@@ -345,6 +364,7 @@ impl SmppServerListener for State {
         conn: &SmppConnectionInformation,
         session_id: &String,
     ) -> submit_sm_resp {
+        self.pace_inbound(session_id).await;
         let pdu = Pdu::from_submit(&request);
         let session = self.esme_session(session_id, conn).await;
         match dispatch_pdu(&self.script, "submit_sm", pdu, session).await {
@@ -366,6 +386,7 @@ impl SmppServerListener for State {
         conn: &SmppConnectionInformation,
         session_id: &String,
     ) -> data_sm_resp {
+        self.pace_inbound(session_id).await;
         let pdu = Pdu::from_data(&request);
         let session = self.esme_session(session_id, conn).await;
         match dispatch_pdu_opt(&self.script, "data_sm", pdu, session).await {
@@ -457,6 +478,7 @@ impl SmppServerListener for State {
         conn: &SmppConnectionInformation,
         session_id: &String,
     ) -> submit_sm_multi_resp {
+        self.pace_inbound(session_id).await;
         let pdu = Pdu::from_submit_multi(&request);
         let session = self.esme_session(session_id, conn).await;
         match dispatch_pdu_opt(&self.script, "submit_sm_multi", pdu, session).await {
@@ -481,8 +503,8 @@ impl SmppServerListener for State {
             let binding = self.esmes.lock().await;
             binding
                 .iter()
-                .find(|e| e.session_id == *session_id)
-                .cloned()
+                .find(|e| e.esme.session_id == *session_id)
+                .map(|e| e.esme.clone())
         };
         if let Some(esme) = esme {
             let _ = esme.send_unbind().await;
@@ -496,7 +518,15 @@ impl SmppServerListener for State {
             system_id: esme.system_id.clone(),
             client_addr: esme.client_address.to_string(),
         };
-        self.esmes.lock().await.push(Arc::new(esme));
+        // Per-session inbound rate limiter, sized from
+        // `server.max_msg_per_sec` (the ingress mirror of a bind's
+        // outbound throttle). `None` when unlimited.
+        let throttle =
+            (self.inbound_max_mps > 0).then(|| Arc::new(RateLimiter::new(self.inbound_max_mps)));
+        self.esmes.lock().await.push(EsmeSession {
+            esme: Arc::new(esme),
+            throttle,
+        });
         dispatch_session(&self.script, "bound", session).await;
     }
 
@@ -505,9 +535,9 @@ impl SmppServerListener for State {
             let mut esmes = self.esmes.lock().await;
             let found = esmes
                 .iter()
-                .find(|e| e.session_id == *session_id)
-                .map(|e| (e.system_id.clone(), e.client_address.to_string()));
-            esmes.retain(|e| e.session_id != *session_id);
+                .find(|e| e.esme.session_id == *session_id)
+                .map(|e| (e.esme.system_id.clone(), e.esme.client_address.to_string()));
+            esmes.retain(|e| e.esme.session_id != *session_id);
             found
         };
         let (system_id, client_addr) = removed.unwrap_or_default();
@@ -530,8 +560,8 @@ impl State {
             let esmes = self.esmes.lock().await;
             esmes
                 .iter()
-                .find(|e| e.session_id == session_id)
-                .map(|e| e.system_id.clone())
+                .find(|e| e.esme.session_id == session_id)
+                .map(|e| e.esme.system_id.clone())
                 .unwrap_or_default()
         };
         Session {
@@ -539,6 +569,25 @@ impl State {
             session_id: session_id.to_string(),
             system_id,
             client_addr: conn.client_address.to_string(),
+        }
+    }
+
+    /// Pace an inbound message PDU against its session's rate limiter, if
+    /// one is configured. Clones the limiter out and **drops the `esmes`
+    /// lock before awaiting** (pacing must not hold the lock and stall
+    /// other sessions), then blocks for a token — delaying the `*_resp`
+    /// so the ESME's outstanding-PDU window backpressures its submit rate
+    /// down to `server.max_msg_per_sec`. No-op for unlimited sessions.
+    async fn pace_inbound(&self, session_id: &str) {
+        let limiter = {
+            let esmes = self.esmes.lock().await;
+            esmes
+                .iter()
+                .find(|e| e.esme.session_id == session_id)
+                .and_then(|e| e.throttle.clone())
+        };
+        if let Some(limiter) = limiter {
+            limiter.acquire().await;
         }
     }
 }
