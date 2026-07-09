@@ -10,7 +10,9 @@
 //!
 //! Run: `cargo bench`
 
-use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
+use std::hint::black_box;
+
+use criterion::{criterion_group, criterion_main, Criterion, Throughput};
 
 use siphon_smpp::pyclasses::Pdu;
 use siphon_smpp::{Receipt, SmppConfig};
