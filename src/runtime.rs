@@ -45,6 +45,7 @@ use smpp34::{
 use tokio::sync::Mutex;
 
 use crate::config::{BindConfig, ThrottleAction};
+use crate::metrics;
 use crate::pyclasses::{AlertNotification, Bind, BindResult, Pdu, PduReply, Session, SourceKind};
 use crate::SmppConfig;
 
@@ -131,8 +132,11 @@ impl RateLimiter {
         }
     }
 
-    /// Block until a token is available, then consume it.
-    pub(crate) async fn acquire(&self) {
+    /// Block until a token is available, then consume it. Returns `true`
+    /// if it had to wait for a refill (the caller was paced/throttled),
+    /// `false` if a token was free immediately.
+    pub(crate) async fn acquire(&self) -> bool {
+        let mut waited = false;
         loop {
             let wait = {
                 let mut b = self.inner.lock().await;
@@ -142,11 +146,12 @@ impl RateLimiter {
                 b.last = now;
                 if b.tokens >= 1.0 {
                     b.tokens -= 1.0;
-                    return;
+                    return waited;
                 }
                 let deficit = 1.0 - b.tokens;
                 std::time::Duration::from_secs_f64(deficit / b.refill_per_sec)
             };
+            waited = true;
             tokio::time::sleep(wait).await;
         }
     }
@@ -186,6 +191,10 @@ pub fn spawn(cfg: SmppConfig, script: ScriptHandle) {
         return;
     }
     let handle = script.tokio_handle().clone();
+
+    // Register the SMPP metrics and spawn the binds sampler. Guarded, and
+    // a no-op when the host metrics engine is not initialised.
+    metrics::install(&handle, &state);
 
     // ── Server (inbound binds) ──────────────────────────────────────
     let (host, port) = cfg.listen();
@@ -322,6 +331,11 @@ async fn run_bind_loop(state: Arc<State>, cfg: BindConfig) {
             backoff_ms = 1_000;
         }
 
+        // Count only drops of a session that actually came up — an initial
+        // connect that never bound is a failed attempt, not a reconnect.
+        if bound_at.is_some() {
+            metrics::record_bind_reconnect(&cfg.name);
+        }
         tracing::warn!(target: "siphon_smpp",
             bind=%cfg.name, "bind down, reconnecting in {}ms", backoff_ms);
         // Drop `client` here so its Drop->stop() aborts any leftover
@@ -344,6 +358,7 @@ impl SmppServerListener for State {
     ) -> bind_transmitter_resp {
         // TX-only binds intentionally rejected — siphon-smpp only
         // supports transceiver binds (mirrors the reference policy).
+        metrics::record_bind_request(metrics::REJECTED);
         request.reject(SmppError::ESME_RINVSYSID)
     }
 
@@ -353,6 +368,7 @@ impl SmppServerListener for State {
         _conn: &SmppConnectionInformation,
         _session: &String,
     ) -> bind_receiver_resp {
+        metrics::record_bind_request(metrics::REJECTED);
         request.reject(SmppError::ESME_RINVSYSID)
     }
 
@@ -375,11 +391,13 @@ impl SmppServerListener for State {
                 from=%conn.client_address, system_id=%request.system_id,
                 status=?outcome.status, reason=%outcome.reason,
                 "bind_transceiver rejected");
+            metrics::record_bind_request(metrics::REJECTED);
             return request.reject(outcome.status);
         }
         tracing::info!(target: "siphon_smpp",
             from=%conn.client_address, system_id=%request.system_id,
             "bind_transceiver accepted");
+        metrics::record_bind_request(metrics::ACCEPTED);
         let echo = request.system_id.clone();
         request.accept(echo, Some(0x34))
     }
@@ -395,18 +413,26 @@ impl SmppServerListener for State {
         if let InboundAdmit::Throttled = self.admit_inbound(session_id).await {
             tracing::debug!(target: "siphon_smpp", session=%session_id,
                 "submit_sm throttled → ESME_RTHROTTLED");
+            metrics::record_pdu(metrics::INBOUND, "submit_sm", metrics::REJECTED);
             return request.reject(SmppError::ESME_RTHROTTLED);
         }
         let pdu = Pdu::from_submit(&request);
         let session = self.esme_session(session_id, conn).await;
         match dispatch_pdu(&self.script, "submit_sm", pdu, session).await {
             Ok(reply) => match reply.message_id {
-                Some(id) => request.accept(id),
-                None => request.reject(reply.command_status),
+                Some(id) => {
+                    metrics::record_pdu(metrics::INBOUND, "submit_sm", metrics::ACCEPTED);
+                    request.accept(id)
+                }
+                None => {
+                    metrics::record_pdu(metrics::INBOUND, "submit_sm", metrics::REJECTED);
+                    request.reject(reply.command_status)
+                }
             },
             Err(e) => {
                 tracing::error!(target: "siphon_smpp",
                     error=%e, "@smpp.on_pdu(submit_sm) raised");
+                metrics::record_pdu(metrics::INBOUND, "submit_sm", metrics::REJECTED);
                 request.reject(SmppError::ESME_RSYSERR)
             }
         }
@@ -421,23 +447,35 @@ impl SmppServerListener for State {
         if let InboundAdmit::Throttled = self.admit_inbound(session_id).await {
             tracing::debug!(target: "siphon_smpp", session=%session_id,
                 "data_sm throttled → ESME_RTHROTTLED");
+            metrics::record_pdu(metrics::INBOUND, "data_sm", metrics::REJECTED);
             return request.reject(SmppError::ESME_RTHROTTLED);
         }
         let pdu = Pdu::from_data(&request);
         let session = self.esme_session(session_id, conn).await;
         match dispatch_pdu_opt(&self.script, "data_sm", pdu, session).await {
             // No handler → reject (data_sm is opt-in, like the smpp34 default).
-            None => request.reject(SmppError::ESME_RSYSERR),
+            None => {
+                metrics::record_pdu(metrics::INBOUND, "data_sm", metrics::REJECTED);
+                request.reject(SmppError::ESME_RSYSERR)
+            }
             Some(Ok(reply)) => match reply.message_id {
-                Some(id) => request.accept(id),
+                Some(id) => {
+                    metrics::record_pdu(metrics::INBOUND, "data_sm", metrics::ACCEPTED);
+                    request.accept(id)
+                }
                 None if reply.command_status == SmppError::ESME_ROK => {
+                    metrics::record_pdu(metrics::INBOUND, "data_sm", metrics::ACCEPTED);
                     request.accept(String::new())
                 }
-                None => request.reject(reply.command_status),
+                None => {
+                    metrics::record_pdu(metrics::INBOUND, "data_sm", metrics::REJECTED);
+                    request.reject(reply.command_status)
+                }
             },
             Some(Err(e)) => {
                 tracing::error!(target: "siphon_smpp",
                     error=%e, "@smpp.on_pdu(data_sm) raised");
+                metrics::record_pdu(metrics::INBOUND, "data_sm", metrics::REJECTED);
                 request.reject(SmppError::ESME_RSYSERR)
             }
         }
@@ -452,12 +490,22 @@ impl SmppServerListener for State {
         let pdu = Pdu::from_cancel(&request);
         let session = self.esme_session(session_id, conn).await;
         match dispatch_pdu_opt(&self.script, "cancel_sm", pdu, session).await {
-            None => request.reject(SmppError::ESME_RCANCELFAIL),
-            Some(Ok(reply)) if reply.command_status == SmppError::ESME_ROK => request.accept(),
-            Some(Ok(reply)) => request.reject(reply.command_status),
+            None => {
+                metrics::record_pdu(metrics::INBOUND, "cancel_sm", metrics::REJECTED);
+                request.reject(SmppError::ESME_RCANCELFAIL)
+            }
+            Some(Ok(reply)) if reply.command_status == SmppError::ESME_ROK => {
+                metrics::record_pdu(metrics::INBOUND, "cancel_sm", metrics::ACCEPTED);
+                request.accept()
+            }
+            Some(Ok(reply)) => {
+                metrics::record_pdu(metrics::INBOUND, "cancel_sm", metrics::REJECTED);
+                request.reject(reply.command_status)
+            }
             Some(Err(e)) => {
                 tracing::error!(target: "siphon_smpp",
                     error=%e, "@smpp.on_pdu(cancel_sm) raised");
+                metrics::record_pdu(metrics::INBOUND, "cancel_sm", metrics::REJECTED);
                 request.reject(SmppError::ESME_RCANCELFAIL)
             }
         }
@@ -472,17 +520,27 @@ impl SmppServerListener for State {
         let pdu = Pdu::from_query(&request);
         let session = self.esme_session(session_id, conn).await;
         match dispatch_pdu_opt(&self.script, "query_sm", pdu, session).await {
-            None => request.reject(SmppError::ESME_RQUERYFAIL),
-            Some(Ok(reply)) if reply.command_status == SmppError::ESME_ROK => request.accept(
-                reply.message_id.unwrap_or_default(),
-                reply.final_date,
-                reply.message_state.unwrap_or(0),
-                reply.error_code,
-            ),
-            Some(Ok(reply)) => request.reject(reply.command_status),
+            None => {
+                metrics::record_pdu(metrics::INBOUND, "query_sm", metrics::REJECTED);
+                request.reject(SmppError::ESME_RQUERYFAIL)
+            }
+            Some(Ok(reply)) if reply.command_status == SmppError::ESME_ROK => {
+                metrics::record_pdu(metrics::INBOUND, "query_sm", metrics::ACCEPTED);
+                request.accept(
+                    reply.message_id.unwrap_or_default(),
+                    reply.final_date,
+                    reply.message_state.unwrap_or(0),
+                    reply.error_code,
+                )
+            }
+            Some(Ok(reply)) => {
+                metrics::record_pdu(metrics::INBOUND, "query_sm", metrics::REJECTED);
+                request.reject(reply.command_status)
+            }
             Some(Err(e)) => {
                 tracing::error!(target: "siphon_smpp",
                     error=%e, "@smpp.on_pdu(query_sm) raised");
+                metrics::record_pdu(metrics::INBOUND, "query_sm", metrics::REJECTED);
                 request.reject(SmppError::ESME_RQUERYFAIL)
             }
         }
@@ -497,12 +555,22 @@ impl SmppServerListener for State {
         let pdu = Pdu::from_replace(&request);
         let session = self.esme_session(session_id, conn).await;
         match dispatch_pdu_opt(&self.script, "replace_sm", pdu, session).await {
-            None => request.reject(SmppError::ESME_RREPLACEFAIL),
-            Some(Ok(reply)) if reply.command_status == SmppError::ESME_ROK => request.accept(),
-            Some(Ok(reply)) => request.reject(reply.command_status),
+            None => {
+                metrics::record_pdu(metrics::INBOUND, "replace_sm", metrics::REJECTED);
+                request.reject(SmppError::ESME_RREPLACEFAIL)
+            }
+            Some(Ok(reply)) if reply.command_status == SmppError::ESME_ROK => {
+                metrics::record_pdu(metrics::INBOUND, "replace_sm", metrics::ACCEPTED);
+                request.accept()
+            }
+            Some(Ok(reply)) => {
+                metrics::record_pdu(metrics::INBOUND, "replace_sm", metrics::REJECTED);
+                request.reject(reply.command_status)
+            }
             Some(Err(e)) => {
                 tracing::error!(target: "siphon_smpp",
                     error=%e, "@smpp.on_pdu(replace_sm) raised");
+                metrics::record_pdu(metrics::INBOUND, "replace_sm", metrics::REJECTED);
                 request.reject(SmppError::ESME_RREPLACEFAIL)
             }
         }
@@ -517,22 +585,31 @@ impl SmppServerListener for State {
         if let InboundAdmit::Throttled = self.admit_inbound(session_id).await {
             tracing::debug!(target: "siphon_smpp", session=%session_id,
                 "submit_sm_multi throttled → ESME_RTHROTTLED");
+            metrics::record_pdu(metrics::INBOUND, "submit_sm_multi", metrics::REJECTED);
             return request.reject(SmppError::ESME_RTHROTTLED);
         }
         let pdu = Pdu::from_submit_multi(&request);
         let session = self.esme_session(session_id, conn).await;
         match dispatch_pdu_opt(&self.script, "submit_sm_multi", pdu, session).await {
             // Opt-in, like submit_sm's data-path siblings: no handler → reject.
-            None => request.reject(SmppError::ESME_RSYSERR),
+            None => {
+                metrics::record_pdu(metrics::INBOUND, "submit_sm_multi", metrics::REJECTED);
+                request.reject(SmppError::ESME_RSYSERR)
+            }
             // accept(message_id, unsuccess_sme); we don't surface per-dest
             // unsuccess yet — an all-or-nothing accept covers the common case.
             Some(Ok(reply)) if reply.command_status == SmppError::ESME_ROK => {
+                metrics::record_pdu(metrics::INBOUND, "submit_sm_multi", metrics::ACCEPTED);
                 request.accept(reply.message_id.unwrap_or_default(), Vec::new())
             }
-            Some(Ok(reply)) => request.reject(reply.command_status),
+            Some(Ok(reply)) => {
+                metrics::record_pdu(metrics::INBOUND, "submit_sm_multi", metrics::REJECTED);
+                request.reject(reply.command_status)
+            }
             Some(Err(e)) => {
                 tracing::error!(target: "siphon_smpp",
                     error=%e, "@smpp.on_pdu(submit_sm_multi) raised");
+                metrics::record_pdu(metrics::INBOUND, "submit_sm_multi", metrics::REJECTED);
                 request.reject(SmppError::ESME_RSYSERR)
             }
         }
@@ -639,13 +716,17 @@ impl State {
         };
         match self.inbound_throttle_action {
             ThrottleAction::Pace => {
-                limiter.acquire().await;
+                // A pacing wait is an inbound throttle event.
+                if limiter.acquire().await {
+                    metrics::record_throttled(metrics::INBOUND);
+                }
                 InboundAdmit::Proceed
             }
             ThrottleAction::Reject => {
                 if limiter.try_acquire().await {
                     InboundAdmit::Proceed
                 } else {
+                    metrics::record_throttled(metrics::INBOUND);
                     InboundAdmit::Throttled
                 }
             }
@@ -684,12 +765,19 @@ impl SmppClientListener for BindListener {
         let pdu = Pdu::from_deliver(&request);
         let session = self.bind_session(session_id, conn);
         match dispatch_pdu(&self.state.script, "deliver_sm", pdu, session).await {
-            Ok(reply) if reply.command_status == SmppError::ESME_ROK => request.accept(),
-            Ok(reply) => request.reject(reply.command_status),
+            Ok(reply) if reply.command_status == SmppError::ESME_ROK => {
+                metrics::record_pdu(metrics::EGRESS, "deliver_sm", metrics::ACCEPTED);
+                request.accept()
+            }
+            Ok(reply) => {
+                metrics::record_pdu(metrics::EGRESS, "deliver_sm", metrics::REJECTED);
+                request.reject(reply.command_status)
+            }
             Err(e) => {
                 tracing::error!(target: "siphon_smpp",
                     bind=%self.bind_name, error=%e,
                     "@smpp.on_pdu(deliver_sm) raised");
+                metrics::record_pdu(metrics::EGRESS, "deliver_sm", metrics::REJECTED);
                 request.reject(SmppError::ESME_RSYSERR)
             }
         }
@@ -704,15 +792,23 @@ impl SmppClientListener for BindListener {
         let pdu = Pdu::from_data(&request);
         let session = self.bind_session(session_id, conn);
         match dispatch_pdu_opt(&self.state.script, "data_sm", pdu, session).await {
-            None => request.reject(SmppError::ESME_RSYSERR),
+            None => {
+                metrics::record_pdu(metrics::EGRESS, "data_sm", metrics::REJECTED);
+                request.reject(SmppError::ESME_RSYSERR)
+            }
             Some(Ok(reply)) if reply.command_status == SmppError::ESME_ROK => {
+                metrics::record_pdu(metrics::EGRESS, "data_sm", metrics::ACCEPTED);
                 request.accept(reply.message_id.unwrap_or_default())
             }
-            Some(Ok(reply)) => request.reject(reply.command_status),
+            Some(Ok(reply)) => {
+                metrics::record_pdu(metrics::EGRESS, "data_sm", metrics::REJECTED);
+                request.reject(reply.command_status)
+            }
             Some(Err(e)) => {
                 tracing::error!(target: "siphon_smpp",
                     bind=%self.bind_name, error=%e,
                     "@smpp.on_pdu(data_sm) raised");
+                metrics::record_pdu(metrics::EGRESS, "data_sm", metrics::REJECTED);
                 request.reject(SmppError::ESME_RSYSERR)
             }
         }
@@ -728,10 +824,17 @@ impl SmppClientListener for BindListener {
         // react, e.g. flush queued MT for the now-available MS.
         let alert = AlertNotification::from_alert(&request);
         let session = self.bind_session(session_id, conn);
-        if let Err(e) = dispatch_alert(&self.state.script, alert, session).await {
-            tracing::error!(target: "siphon_smpp",
-                bind=%self.bind_name, error=%e,
-                "@smpp.on_pdu(alert_notification) raised");
+        match dispatch_alert(&self.state.script, alert, session).await {
+            Ok(()) => metrics::record_pdu(metrics::EGRESS, "alert_notification", metrics::ACCEPTED),
+            Err(e) => {
+                tracing::error!(target: "siphon_smpp",
+                    bind=%self.bind_name, error=%e,
+                    "@smpp.on_pdu(alert_notification) raised");
+                // alert_notification bypasses the central dispatch timer, so
+                // count the raised handler here.
+                metrics::record_dispatch_error("alert_notification");
+                metrics::record_pdu(metrics::EGRESS, "alert_notification", metrics::REJECTED);
+            }
         }
     }
 
@@ -831,7 +934,20 @@ async fn dispatch_pdu_opt(
         Ok(None) => return None,
         Err(e) => return Some(Err(e)),
     };
-    Some(call_pdu_handler(script, handler, pdu, session).await)
+    // Time the handler invocation and count a raised handler once,
+    // centrally for every PDU command that dispatches through here
+    // (submit/data/cancel/query/replace/submit_multi/deliver). The clock is
+    // read only when metrics are enabled — with metrics off the dispatch
+    // path adds nothing but a couple of OnceLock loads.
+    let started = metrics::enabled().then(Instant::now);
+    let result = call_pdu_handler(script, handler, pdu, session).await;
+    if let Some(started) = started {
+        metrics::observe_dispatch(command, started.elapsed().as_secs_f64());
+    }
+    if result.is_err() {
+        metrics::record_dispatch_error(command);
+    }
+    Some(result)
 }
 
 async fn call_pdu_handler(

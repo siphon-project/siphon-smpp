@@ -20,6 +20,7 @@ use smpp34::client::SMSC;
 use smpp34::server::ESME;
 use smpp34::DestAddress;
 
+use crate::metrics;
 use crate::runtime::{self, RateLimiter, State};
 use std::sync::Arc;
 
@@ -180,7 +181,10 @@ pub fn submit_via<'py>(
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let (smsc, throttle) = bind_handle(&state, &bind).await?;
         if let Some(limiter) = throttle {
-            limiter.acquire().await;
+            // A pacing wait is an egress throttle event.
+            if limiter.acquire().await {
+                metrics::record_throttled(metrics::EGRESS);
+            }
         }
         let resp = smsc
             .submit_sm()
@@ -273,7 +277,10 @@ pub fn submit_multi_via<'py>(
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let (smsc, throttle) = bind_handle(&state, &bind).await?;
         if let Some(limiter) = throttle {
-            limiter.acquire().await;
+            // A pacing wait is an egress throttle event.
+            if limiter.acquire().await {
+                metrics::record_throttled(metrics::EGRESS);
+            }
         }
         let resp = smsc
             .send_submit_sm_multi(
@@ -343,7 +350,10 @@ pub fn data_via<'py>(
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
         let (smsc, throttle) = bind_handle(&state, &bind).await?;
         if let Some(limiter) = throttle {
-            limiter.acquire().await;
+            // A pacing wait is an egress throttle event.
+            if limiter.acquire().await {
+                metrics::record_throttled(metrics::EGRESS);
+            }
         }
         let resp = smsc
             .send_data_sm(

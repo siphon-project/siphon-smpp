@@ -51,6 +51,7 @@
 
 pub mod config;
 pub mod install;
+pub(crate) mod metrics;
 pub mod pyclasses;
 pub mod runtime;
 pub mod sends;
