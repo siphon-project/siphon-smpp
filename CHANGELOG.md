@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+
+- **Prometheus metrics** — SMPP observability registered into siphon's shared
+  metrics store (`custom_metrics()`), the same registry that serves `/metrics`;
+  no `prometheus` dependency is added to this crate. `siphon_smpp_binds`
+  (gauge, `direction`/`state`) reports bound sessions and is sampled every 10s;
+  `siphon_smpp_pdus_total` (`direction`/`command`/`result`),
+  `siphon_smpp_throttled_total` (`direction`),
+  `siphon_smpp_bind_reconnects_total` (`bind`),
+  `siphon_smpp_dispatch_errors_total` (`command`),
+  `siphon_smpp_dispatch_duration_seconds` (histogram, `command`) and
+  `siphon_smpp_bind_requests_total` (`result`) are recorded inline at the
+  dispatch and bind sites. When the host metrics engine is not initialised
+  (e.g. headless, no admin server) the series are skipped with one log line and
+  every emit path is a no-op — the dispatch hot path then reads no clock and
+  touches no metric, only a couple of `OnceLock` loads. Bench group `metrics`
+  covers the enabled-path per-PDU cost.
+
 ## [1.2.1] — 2026-07-01
 
 ### Added

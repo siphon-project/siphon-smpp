@@ -3,3 +3,4 @@
 *.pdb
 __pycache__/
 /site/
+/.claude/

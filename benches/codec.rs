@@ -137,5 +137,85 @@ fn bench_config(c: &mut Criterion) {
     g.finish();
 }
 
-criterion_group!(benches, bench_mapping, bench_receipt, bench_config);
+/// The per-PDU cost of the metrics instrumentation added on the dispatch and
+/// bind paths. Every instrumented PDU already crosses into Python (pyo3 +
+/// asyncio, microseconds and up), so this is the overhead relative to that
+/// dominating cost. Two regimes:
+///
+///   * **disabled** — headless / no admin server. The inline `record_*`
+///     helpers early-return after one `OnceLock` read; the dispatch timer is
+///     not even armed. This is `emit_disabled` below.
+///   * **enabled** — the shared store is up. Each emit routes through
+///     siphon's `custom_metrics()` (a map lookup + a bounded cardinality
+///     check + an atomic). `pdus_total_inc` / `dispatch_duration_observe`
+///     replicate exactly what the dispatch arms call.
+fn bench_metrics(c: &mut Criterion) {
+    let mut g = c.benchmark_group("metrics");
+    g.throughput(Throughput::Elements(1));
+
+    // Measured before init() so the store is genuinely absent: the cost an
+    // inline record_* helper pays when siphon-smpp runs headless.
+    g.bench_function("emit_disabled", |b| {
+        b.iter(|| black_box(siphon::metrics::custom_metrics().is_some()))
+    });
+
+    // Bring the shared store up and register pdus_total-/duration-shaped
+    // series so the enabled-path benches hit the real code.
+    siphon::metrics::init().unwrap();
+    let cm = siphon::metrics::custom_metrics().unwrap();
+    let _ = cm.register_counter(
+        "bench_smpp_pdus_total",
+        "bench",
+        &["direction", "command", "result"],
+    );
+    let _ = cm.register_histogram(
+        "bench_smpp_dispatch_seconds",
+        "bench",
+        &["command"],
+        vec![0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0],
+    );
+
+    g.bench_function("pdus_total_inc", |b| {
+        b.iter(|| {
+            let _ = cm.counter_inc(
+                "bench_smpp_pdus_total",
+                black_box(&[
+                    ("direction", "inbound"),
+                    ("command", "submit_sm"),
+                    ("result", "accepted"),
+                ]),
+                1.0,
+            );
+        })
+    });
+
+    g.bench_function("dispatch_duration_observe", |b| {
+        b.iter(|| {
+            let _ = cm.histogram_observe(
+                "bench_smpp_dispatch_seconds",
+                black_box(&[("command", "submit_sm")]),
+                black_box(0.012),
+            );
+        })
+    });
+
+    // The clock pair the dispatch path uses to feed the duration histogram
+    // (only armed when the store is up).
+    g.bench_function("dispatch_timer_pair", |b| {
+        b.iter(|| {
+            let t = std::time::Instant::now();
+            black_box(t.elapsed())
+        })
+    });
+
+    g.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_mapping,
+    bench_receipt,
+    bench_config,
+    bench_metrics
+);
 criterion_main!(benches);
