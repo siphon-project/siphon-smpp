@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.0] — 2026-07-09
+
 ### Added
 
 - **Prometheus metrics** — SMPP observability registered into siphon's shared
@@ -24,6 +26,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   every emit path is a no-op — the dispatch hot path then reads no clock and
   touches no metric, only a couple of `OnceLock` loads. Bench group `metrics`
   covers the enabled-path per-PDU cost.
+
+### Changed
+
+- Dependency bumps: `criterion` 0.5 → 0.8 (dev-only bench harness; switched to
+  `std::hint::black_box`), the `siphon-sip` git pin to `7b0fab0`, and the
+  GitHub Actions workflow dependencies.
 
 ## [1.2.1] — 2026-07-01
 
