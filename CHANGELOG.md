@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Lost SMPP responses under pipelining, via `smpp34` 1.2.1.** Both of smpp34's
+  writer tasks registered a request's pending-response entry only after the socket
+  write returned, while the read loop drops any response it has no entry for. A
+  response arriving in that gap was discarded and the caller blocked until its
+  response timer expired (30s), so the PDU was lost rather than slow. This hit the
+  SMSC to ESME direction too, which is `deliver_to`, the delivery-receipt path.
+  Measured on the load harness pinned to 2 CPUs, 5000 submits per run: 10 of 30
+  runs lost at least one response on 1.2.0, 0 of 52 on 1.2.1.
+
 ### Changed
 
 - **The load harness now surfaces smpp34's diagnostics.** `smpp-load` installed no
