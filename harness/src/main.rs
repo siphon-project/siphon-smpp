@@ -18,6 +18,7 @@
 //!   # term 1: your siphon-bin with the smpp feature + echo.py
 //!   smpp-load drive --host <siphon-host> --port 2775 --count 1000000 --window 128
 
+use std::collections::HashMap;
 use std::net::IpAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -81,8 +82,18 @@ struct ServeArgs {
     port: u16,
 }
 
+/// smpp34 reports a lost or undecodable PDU through `log` (`No pending request
+/// for sequence_number N`, `unable to decode ...`, `Response for sequence_number
+/// N did not come in after Nms`). With no subscriber installed those lines are
+/// discarded, so a failed run reports a bare `errors 1` with nothing to explain
+/// it. Default to `warn` so they surface unasked; `RUST_LOG` still overrides.
+fn init_logging() {
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn")).init();
+}
+
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
+    init_logging();
     match Cli::parse().cmd {
         Cmd::Serve(a) => serve(a).await,
         Cmd::Drive(a) => drive(a).await,
@@ -185,6 +196,9 @@ async fn drive(a: DriveArgs) {
     let sem = Arc::new(Semaphore::new(a.window));
     let latencies = Arc::new(Mutex::new(Vec::<u64>::with_capacity(a.count)));
     let errors = Arc::new(AtomicU64::new(0));
+    // Keep *why* each submit failed, not just how many did. A bare count can't
+    // distinguish a rejected submit from a response that never arrived.
+    let failures = Arc::new(Mutex::new(HashMap::<String, u64>::new()));
 
     // Warm up (excluded from the measurement window).
     for _ in 0..a.window.min(a.count) {
@@ -207,6 +221,7 @@ async fn drive(a: DriveArgs) {
         let dst = a.destination_addr.clone();
         let lat = latencies.clone();
         let errs = errors.clone();
+        let fails = failures.clone();
         handles.push(tokio::spawn(async move {
             let t0 = Instant::now();
             let r = smsc
@@ -218,8 +233,9 @@ async fn drive(a: DriveArgs) {
                 .await;
             match r {
                 Ok(_) => lat.lock().await.push(t0.elapsed().as_micros() as u64),
-                Err(_) => {
+                Err(e) => {
                     errs.fetch_add(1, Ordering::Relaxed);
+                    *fails.lock().await.entry(format!("{e:?}")).or_insert(0) += 1;
                 }
             }
             drop(permit);
@@ -233,10 +249,15 @@ async fn drive(a: DriveArgs) {
     let _ = smsc.send_unbind().await;
     client.stop().await;
 
-    report(&latencies.lock().await, errors.load(Ordering::Relaxed), elapsed);
+    report(
+        &latencies.lock().await,
+        errors.load(Ordering::Relaxed),
+        &*failures.lock().await,
+        elapsed,
+    );
 }
 
-fn report(latencies: &[u64], errors: u64, elapsed: Duration) {
+fn report(latencies: &[u64], errors: u64, failures: &HashMap<String, u64>, elapsed: Duration) {
     let ok = latencies.len() as u64;
     let total = ok + errors;
     let secs = elapsed.as_secs_f64().max(1e-9);
@@ -267,6 +288,16 @@ fn report(latencies: &[u64], errors: u64, elapsed: Duration) {
         );
     }
     if errors > 0 {
+        let mut breakdown: Vec<_> = failures.iter().collect();
+        breakdown.sort_by(|a, b| b.1.cmp(a.1).then_with(|| a.0.cmp(b.0)));
+        println!("  failures  :");
+        for (reason, count) in breakdown {
+            println!("    {count} x {reason}");
+        }
+        println!(
+            "  note      : ESME_RSYSERR here is usually a response that never \
+             arrived (see the smpp34 log lines above), not a rejected submit"
+        );
         std::process::exit(1);
     }
 }

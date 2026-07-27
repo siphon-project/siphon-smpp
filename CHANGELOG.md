@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **The load harness now surfaces smpp34's diagnostics.** `smpp-load` installed no
+  `log` subscriber, so every `error!` the codec emits (a dropped response, an
+  undecodable PDU, a request that never got answered) went nowhere and a failed
+  run reported a bare `errors 1` with nothing to explain it. It now defaults to
+  `RUST_LOG=warn`, and the failure summary breaks the count down by SMPP error
+  instead of only totalling it. This is diagnostics only, the pass/fail rule is
+  unchanged: any error still fails the run.
+
 ## [1.3.0] — 2026-07-09
 
 ### Added

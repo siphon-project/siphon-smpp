@@ -21,6 +21,10 @@ smpp34 = "1.2"
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 async-trait = "0.1"
+# smpp34 reports lost/undecodable PDUs through `log`. Without a subscriber those
+# diagnostics go nowhere, which turns any harness failure into guesswork — see
+# the `init_logging` note in src/main.rs.
+env_logger = "0.11"
 
 # Standalone workspace so this package never joins siphon-smpp's graph.
 [workspace]
