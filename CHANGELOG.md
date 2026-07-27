@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.3.1] — 2026-07-27
+
 ### Fixed
 
 - **Lost SMPP responses under pipelining, via `smpp34` 1.2.1.** Both of smpp34's
@@ -27,6 +29,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   `RUST_LOG=warn`, and the failure summary breaks the count down by SMPP error
   instead of only totalling it. This is diagnostics only, the pass/fail rule is
   unchanged: any error still fails the run.
+- **Dependency bumps.** `siphon-sip` to 1.5.0 and `smpp34` to 1.2.1; the
+  cargo-minor-patch group (async-trait, serde, thiserror, tokio); and the lockfile
+  moves that cleared RUSTSEC-2026-0204 (`crossbeam-epoch` to 0.9.20, an invalid
+  pointer dereference in the `fmt::Pointer` impl for `Atomic`/`Shared`) and the
+  yanked `spin` 0.9.8.
 
 ## [1.3.0] — 2026-07-09
 
