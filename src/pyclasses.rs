@@ -12,8 +12,10 @@ use pyo3::types::{PyBytes, PyDict};
 
 use smpp34::{
     alert_notification, cancel_sm, deliver_sm, query_sm, replace_sm, submit_sm, submit_sm_multi,
-    DestAddress, SmppError,
+    DestAddress, SmppError, Tlv, TlvList,
 };
+
+use crate::tlv::{tag_from_py, tlvs_to_py};
 
 // ── Pdu ─────────────────────────────────────────────────────────────────
 
@@ -64,6 +66,9 @@ pub struct Pdu {
     #[pyo3(get)]
     pub destinations: Vec<String>,
     pub short_message: Vec<u8>,
+    /// Decoded optional parameters (§3.2.1). Empty for `cancel_sm` /
+    /// `query_sm` / `replace_sm`, which have none in 3.4.
+    pub tlvs: Vec<Tlv>,
 }
 
 #[pymethods]
@@ -83,6 +88,107 @@ impl Pdu {
         self.esm_class & 0x40 != 0
     }
 
+    /// **The message body — use this, not `short_message`.**
+    ///
+    /// `message_payload` when the optional parameter is present, else the
+    /// `short_message` field. The two are mutually exclusive (§5.3.2.32) and
+    /// which one a peer picks is its choice: anything over the 254-byte
+    /// `short_message` limit has to go in the TLV, and a `data_sm` has no
+    /// `short_message` field at all. A handler that reads only
+    /// `short_message` silently drops those.
+    #[getter]
+    fn body<'py>(&self, py: Python<'py>) -> Bound<'py, PyBytes> {
+        match self.tlvs.message_payload() {
+            Some(payload) => PyBytes::new(py, payload),
+            None => PyBytes::new(py, &self.short_message),
+        }
+    }
+
+    /// The `message_payload` optional parameter (0x0424), or `None`. The
+    /// only place a `data_sm` body ever lives, and where a long
+    /// `submit_sm` / `deliver_sm` body lives instead of `short_message`.
+    #[getter]
+    fn message_payload<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyBytes>> {
+        self.tlvs.message_payload().map(|p| PyBytes::new(py, p))
+    }
+
+    /// Every decoded optional parameter as `{tag: bytes}`, keyed by the raw
+    /// 16-bit tag so vendor-specific parameters read like the standard ones.
+    /// See [`tlv`](Self::tlv) for lookup by spec name.
+    #[getter]
+    fn tlvs<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyDict>> {
+        tlvs_to_py(py, &self.tlvs)
+    }
+
+    /// One optional parameter's raw value by spec name (`"MESSAGE_PAYLOAD"`)
+    /// or raw tag (`0x1400`), or `None` when the PDU didn't carry it.
+    fn tlv<'py>(
+        &self,
+        py: Python<'py>,
+        tag: &Bound<'py, PyAny>,
+    ) -> PyResult<Option<Bound<'py, PyBytes>>> {
+        let tag = tag_from_py(tag)?;
+        Ok(self
+            .tlvs
+            .get_tlv_raw(tag)
+            .map(|t| PyBytes::new(py, &t.value)))
+    }
+
+    /// `receipted_message_id` (0x001E) — the id of the message a delivery
+    /// receipt refers to, when the SMSC sends the spec form rather than
+    /// only the text body. See [`receipt`](Self::receipt).
+    #[getter]
+    fn receipted_message_id(&self) -> Option<String> {
+        self.tlvs.receipted_message_id()
+    }
+
+    /// `message_state` (0x0427) — 1=ENROUTE, 2=DELIVERED, 3=EXPIRED,
+    /// 4=DELETED, 5=UNDELIVERABLE, 6=ACCEPTED, 7=UNKNOWN, 8=REJECTED.
+    #[getter]
+    fn message_state(&self) -> Option<u8> {
+        self.tlvs.message_state()
+    }
+
+    /// `user_message_reference` (0x0204) — the ESME's own reference,
+    /// echoed back on the receipt by SMSCs that support it.
+    #[getter]
+    fn user_message_reference(&self) -> Option<u16> {
+        self.tlvs.user_message_reference()
+    }
+
+    /// `sar_msg_ref_num` (0x020C) — concatenation reference shared by every
+    /// segment of one long message.
+    #[getter]
+    fn sar_msg_ref_num(&self) -> Option<u16> {
+        self.tlvs.sar_msg_ref_num()
+    }
+
+    /// `sar_total_segments` (0x020E) — how many segments the long message
+    /// was split into.
+    #[getter]
+    fn sar_total_segments(&self) -> Option<u8> {
+        self.tlvs.sar_total_segments()
+    }
+
+    /// `sar_segment_seqnum` (0x020F) — this segment's 1-based position.
+    #[getter]
+    fn sar_segment_seqnum(&self) -> Option<u8> {
+        self.tlvs.sar_segment_seqnum()
+    }
+
+    /// `more_messages_to_send` (0x0426) — 1 when the peer has more traffic
+    /// queued for the same destination.
+    #[getter]
+    fn more_messages_to_send(&self) -> Option<u8> {
+        self.tlvs.more_messages_to_send()
+    }
+
+    /// `network_error_code` (0x0423) as `(network_type, error_code)`.
+    #[getter]
+    fn network_error_code(&self) -> Option<(u8, u16)> {
+        self.tlvs.network_error_code()
+    }
+
     /// True when this `deliver_sm` is a **delivery receipt** (DLR) — the
     /// `esm_class` message-type bits (0x04) flag it as an SMSC delivery
     /// receipt. Route these back to the ESME that originally requested
@@ -94,38 +200,97 @@ impl Pdu {
     }
 
     /// Parsed delivery-receipt fields, or `None` when this PDU is not a
-    /// DLR / the body doesn't follow the de-facto receipt format.
+    /// DLR / carries neither a recognisable receipt body nor the receipt
+    /// optional parameters.
     ///
     /// Returns a dict with the keys that were present:
     /// `id`, `sub`, `dlvrd`, `submit_date`, `done_date`, `stat`, `err`,
-    /// `text`, plus `raw` (the undecoded receipt body). The format is
-    /// not standardised across SMSCs, so this is best-effort — always
-    /// keep `raw` as the source of truth.
+    /// `text`, plus `raw` (the undecoded receipt body) and
+    /// `message_state` (the numeric 0x0427 code) when the TLV is there.
+    ///
+    /// Two sources can carry the same fact. The de-facto text body is
+    /// parsed first and wins, then `receipted_message_id` (0x001E) and
+    /// `message_state` (0x0427) fill in `id` / `stat` if the text didn't
+    /// supply them. The spec calls the TLVs normative, but interop runs on
+    /// the text form and SMSCs populate the TLVs inconsistently, so
+    /// preferring the text is what keeps existing receipts parsing the way
+    /// they always did. Both stay visible — `pdu.receipted_message_id` and
+    /// `pdu.message_state` read the TLVs directly if you want to override.
     #[getter]
     fn receipt<'py>(&self, py: Python<'py>) -> Option<Bound<'py, PyDict>> {
         if !self.is_dlr() {
             return None;
         }
-        let parsed = Receipt::parse(&self.short_message)?;
+        let body: &[u8] = self
+            .tlvs
+            .message_payload()
+            .unwrap_or(self.short_message.as_slice());
+        let tlv_id = self.tlvs.receipted_message_id();
+        let tlv_state = self.tlvs.message_state();
+
+        let mut parsed = match Receipt::parse(body) {
+            Some(parsed) => parsed,
+            // No recognisable text body. Still a receipt if the optional
+            // parameters carry one; otherwise there's nothing to report.
+            None if tlv_id.is_some() || tlv_state.is_some() => Receipt {
+                raw: String::from_utf8_lossy(body).into_owned(),
+                ..Default::default()
+            },
+            None => return None,
+        };
+        if parsed.id.is_none() {
+            parsed.id = tlv_id;
+        }
+        if parsed.stat.is_none() {
+            parsed.stat = tlv_state
+                .and_then(Receipt::message_state_name)
+                .map(str::to_string);
+        }
+
         let d = PyDict::new(py);
         // set_item on a fresh dict can't fail in practice; ignore the
         // Result to keep the getter infallible.
         let _ = parsed.fill_dict(&d);
+        if let Some(state) = tlv_state {
+            let _ = d.set_item("message_state", state);
+        }
         Some(d)
     }
 
     /// Build a reply for the dispatcher. Default is `ESME_ROK` with no
     /// message_id; pass `command_status="ESME_RSUBMITFAIL"` etc. to
     /// reject. Pass `message_id="…"` on success (submit_sm path).
-    #[pyo3(signature = (*, command_status = "ESME_ROK".to_string(), message_id = None))]
-    fn reply(&self, command_status: String, message_id: Option<String>) -> PyResult<PduReply> {
+    ///
+    /// `tlvs` attaches optional parameters to the response and is accepted
+    /// on the **`data_sm` path only** — `data_sm_resp` is the one 3.4
+    /// response PDU with optional parameters (§4.2.3:
+    /// `delivery_failure_reason`, `network_error_code`,
+    /// `additional_status_info_text`, `dpf_result`). Passing them for any
+    /// other command raises rather than dropping them silently, because a
+    /// rejection reason that never reaches the peer is worse than an error.
+    #[pyo3(signature = (*, command_status = "ESME_ROK".to_string(), message_id = None, tlvs = None))]
+    fn reply(
+        &self,
+        command_status: String,
+        message_id: Option<String>,
+        tlvs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<PduReply> {
         let cs = parse_smpp_status(&command_status)?;
+        let tlvs = crate::tlv::tlvs_from_py(tlvs)?;
+        if !tlvs.is_empty() && self.command != "data_sm" {
+            return Err(PyValueError::new_err(format!(
+                "reply(tlvs=…) is only supported on the data_sm path — \
+                 {}_resp has no optional parameters in SMPP 3.4",
+                self.command
+            )));
+        }
         Ok(PduReply {
             command_status: cs,
             message_id,
             message_state: None,
             final_date: String::new(),
             error_code: 0,
+            tlvs,
         })
     }
 
@@ -150,6 +315,7 @@ impl Pdu {
             message_state: Some(message_state),
             final_date,
             error_code,
+            tlvs: Vec::new(),
         }
     }
 
@@ -182,6 +348,7 @@ impl Pdu {
             sm_length: s.sm_length,
             destinations: Vec::new(),
             short_message: s.short_message.clone(),
+            tlvs: s.tlvs.clone(),
         }
     }
 
@@ -204,13 +371,14 @@ impl Pdu {
             sm_length: d.sm_length,
             destinations: Vec::new(),
             short_message: d.short_message.clone(),
+            tlvs: d.tlvs.clone(),
         }
     }
 
-    /// Build a `Pdu` from a `data_sm`. `data_sm` carries its payload in
-    /// the `message_payload` TLV rather than `short_message`, so the
-    /// body is empty here; the addressing + coding fields are the useful
-    /// surface for routing.
+    /// Build a `Pdu` from a `data_sm`. A `data_sm` has no `short_message`
+    /// field at all — its message travels in the `message_payload` TLV
+    /// (§4.2.2) — so `short_message` stays empty here and the body is
+    /// reachable through `pdu.message_payload` / `pdu.body`.
     pub fn from_data(d: &smpp34::data_sm) -> Self {
         Self {
             command: "data_sm".into(),
@@ -230,6 +398,7 @@ impl Pdu {
             sm_length: 0,
             destinations: Vec::new(),
             short_message: Vec::new(),
+            tlvs: d.tlvs.clone(),
         }
     }
 
@@ -254,6 +423,7 @@ impl Pdu {
             sm_length: 0,
             destinations: Vec::new(),
             short_message: Vec::new(),
+            tlvs: Vec::new(),
         }
     }
 
@@ -279,6 +449,7 @@ impl Pdu {
             sm_length: 0,
             destinations: Vec::new(),
             short_message: Vec::new(),
+            tlvs: Vec::new(),
         }
     }
 
@@ -305,6 +476,7 @@ impl Pdu {
             sm_length: r.sm_length,
             destinations: Vec::new(),
             short_message: r.short_message.clone(),
+            tlvs: Vec::new(),
         }
     }
 
@@ -340,6 +512,7 @@ impl Pdu {
             sm_length: m.sm_length,
             destinations,
             short_message: m.short_message.clone(),
+            tlvs: m.tlvs.clone(),
         }
     }
 }
@@ -382,6 +555,24 @@ impl Receipt {
         ("err", "err"),
         ("id", "id"),
     ];
+
+    /// The `stat:` spelling for a `message_state` (0x0427) code — §5.2.28
+    /// paired with the receipt text's seven-character state names
+    /// (Appendix B). `None` for a code outside the 3.4 range, which is a
+    /// peer bug we shouldn't invent a name for.
+    pub fn message_state_name(state: u8) -> Option<&'static str> {
+        Some(match state {
+            1 => "ENROUTE",
+            2 => "DELIVRD",
+            3 => "EXPIRED",
+            4 => "DELETED",
+            5 => "UNDELIV",
+            6 => "ACCEPTD",
+            7 => "UNKNOWN",
+            8 => "REJECTD",
+            _ => return None,
+        })
+    }
 
     pub fn parse(sm: &[u8]) -> Option<Receipt> {
         let raw = String::from_utf8_lossy(sm).into_owned();
@@ -469,19 +660,26 @@ pub struct PduReply {
     pub message_state: Option<u8>,
     pub final_date: String,
     pub error_code: u8,
+    /// `data_sm_resp` optional parameters — see [`Pdu::reply`].
+    pub tlvs: Vec<Tlv>,
 }
 
 #[pymethods]
 impl PduReply {
     #[new]
-    #[pyo3(signature = (*, command_status = "ESME_ROK".to_string(), message_id = None))]
-    fn new(command_status: String, message_id: Option<String>) -> PyResult<Self> {
+    #[pyo3(signature = (*, command_status = "ESME_ROK".to_string(), message_id = None, tlvs = None))]
+    fn new(
+        command_status: String,
+        message_id: Option<String>,
+        tlvs: Option<&Bound<'_, PyDict>>,
+    ) -> PyResult<Self> {
         Ok(Self {
             command_status: parse_smpp_status(&command_status)?,
             message_id,
             message_state: None,
             final_date: String::new(),
             error_code: 0,
+            tlvs: crate::tlv::tlvs_from_py(tlvs)?,
         })
     }
 
@@ -501,6 +699,7 @@ impl PduReply {
             message_state: None,
             final_date: String::new(),
             error_code: 0,
+            tlvs: Vec::new(),
         }
     }
 }
@@ -763,6 +962,7 @@ mod tests {
             sm_length: 0,
             destinations: Vec::new(),
             short_message: Vec::new(),
+            tlvs: Vec::new(),
         }
     }
 
@@ -805,7 +1005,7 @@ mod tests {
     #[test]
     fn pdu_reply_new_accept_with_message_id() {
         Python::attach(|_py| {
-            let r = PduReply::new("ESME_ROK".to_string(), Some("msg-123".to_string()))
+            let r = PduReply::new("ESME_ROK".to_string(), Some("msg-123".to_string()), None)
                 .expect("ESME_ROK is valid");
             assert_eq!(r.command_status, SmppError::ESME_ROK);
             assert_eq!(r.message_id.as_deref(), Some("msg-123"));
@@ -815,7 +1015,7 @@ mod tests {
     #[test]
     fn pdu_reply_new_reject_with_status() {
         Python::attach(|_py| {
-            let r = PduReply::new("ESME_RSUBMITFAIL".to_string(), None)
+            let r = PduReply::new("ESME_RSUBMITFAIL".to_string(), None, None)
                 .expect("ESME_RSUBMITFAIL is valid");
             assert_eq!(r.command_status, SmppError::ESME_RSUBMITFAIL);
             assert!(r.message_id.is_none());
@@ -825,7 +1025,7 @@ mod tests {
     #[test]
     fn pdu_reply_new_rejects_unknown_status() {
         Python::attach(|_py| {
-            assert!(PduReply::new("ESME_BOGUS".to_string(), None).is_err());
+            assert!(PduReply::new("ESME_BOGUS".to_string(), None, None).is_err());
         });
     }
 
@@ -834,7 +1034,7 @@ mod tests {
         // The `#[new]` default args mirror `reply(...)`: no status given
         // means accept (ESME_ROK), no message_id.
         Python::attach(|_py| {
-            let r = PduReply::new("ESME_ROK".to_string(), None).unwrap();
+            let r = PduReply::new("ESME_ROK".to_string(), None, None).unwrap();
             assert_eq!(r.command_status, SmppError::ESME_ROK);
             assert!(r.message_id.is_none());
         });
@@ -846,12 +1046,14 @@ mod tests {
             let pdu = make_pdu(0x00);
             // accept path
             let ok = pdu
-                .reply("ESME_ROK".to_string(), Some("abc".to_string()))
+                .reply("ESME_ROK".to_string(), Some("abc".to_string()), None)
                 .unwrap();
             assert_eq!(ok.command_status, SmppError::ESME_ROK);
             assert_eq!(ok.message_id.as_deref(), Some("abc"));
             // reject path
-            let rej = pdu.reply("ESME_RINVDSTADR".to_string(), None).unwrap();
+            let rej = pdu
+                .reply("ESME_RINVDSTADR".to_string(), None, None)
+                .unwrap();
             assert_eq!(rej.command_status, SmppError::ESME_RINVDSTADR);
         });
     }
@@ -982,6 +1184,265 @@ mod tests {
             assert_eq!(id, "1");
             let stat: String = d.get_item("stat").unwrap().unwrap().extract().unwrap();
             assert_eq!(stat, "DELIVRD");
+        });
+    }
+
+    // ── TLV surface ─────────────────────────────────────────────────────
+
+    use pyo3::types::PyString;
+    use smpp34::TlvTag;
+
+    fn tlv(tag: TlvTag, value: &[u8]) -> Tlv {
+        Tlv::from_tag(tag, value.to_vec())
+    }
+
+    #[test]
+    fn body_prefers_message_payload_over_short_message() {
+        Python::attach(|py| {
+            // §5.3.2.32: the two are mutually exclusive. When a peer picks
+            // the TLV — mandatory over 254 bytes, and the only option on a
+            // data_sm — `body` has to follow it there.
+            let mut pdu = make_pdu(0x00);
+            pdu.short_message = b"ignored".to_vec();
+            pdu.tlvs = vec![tlv(TlvTag::MessagePayload, b"the real body")];
+            assert_eq!(pdu.body(py).as_bytes(), b"the real body");
+            assert_eq!(
+                pdu.message_payload(py).expect("present").as_bytes(),
+                b"the real body"
+            );
+            // The wire field is never rewritten, only read past.
+            assert_eq!(pdu.short_message(py).as_bytes(), b"ignored");
+        });
+    }
+
+    #[test]
+    fn body_falls_back_to_short_message() {
+        Python::attach(|py| {
+            let mut pdu = make_pdu(0x00);
+            pdu.short_message = b"plain".to_vec();
+            assert_eq!(pdu.body(py).as_bytes(), b"plain");
+            assert!(pdu.message_payload(py).is_none());
+        });
+    }
+
+    #[test]
+    fn tlvs_dict_is_keyed_by_raw_tag() {
+        Python::attach(|py| {
+            let mut pdu = make_pdu(0x00);
+            pdu.tlvs = vec![
+                tlv(TlvTag::MessagePayload, b"hi"),
+                Tlv::new(0x1400, vec![0x01]),
+            ];
+            let d = pdu.tlvs(py).expect("dict");
+            let payload: Vec<u8> = d
+                .get_item(0x0424u16)
+                .expect("lookup")
+                .expect("present")
+                .extract()
+                .expect("bytes");
+            assert_eq!(payload, b"hi");
+            // A vendor tag reads exactly like a standard one.
+            let vendor: Vec<u8> = d
+                .get_item(0x1400u16)
+                .expect("lookup")
+                .expect("present")
+                .extract()
+                .expect("bytes");
+            assert_eq!(vendor, vec![0x01]);
+        });
+    }
+
+    #[test]
+    fn tlv_lookup_works_by_name_and_by_raw_tag() {
+        Python::attach(|py| {
+            let mut pdu = make_pdu(0x00);
+            pdu.tlvs = vec![tlv(TlvTag::MessagePayload, b"hi")];
+
+            let by_name = PyString::new(py, "MESSAGE_PAYLOAD").into_any();
+            assert_eq!(
+                pdu.tlv(py, &by_name)
+                    .expect("ok")
+                    .expect("present")
+                    .as_bytes(),
+                b"hi"
+            );
+
+            let by_tag = 0x0424u16.into_pyobject(py).expect("int").into_any();
+            assert_eq!(
+                pdu.tlv(py, &by_tag)
+                    .expect("ok")
+                    .expect("present")
+                    .as_bytes(),
+                b"hi"
+            );
+
+            let absent = PyString::new(py, "MESSAGE_STATE").into_any();
+            assert!(pdu.tlv(py, &absent).expect("ok").is_none());
+        });
+    }
+
+    #[test]
+    fn concatenation_shortcuts_decode_at_their_spec_widths() {
+        // A three-segment long message, segment 2 of 3, reference 0x1234.
+        let mut pdu = make_pdu(0x00);
+        pdu.tlvs = vec![
+            tlv(TlvTag::SarMsgRefNum, &[0x12, 0x34]),
+            tlv(TlvTag::SarTotalSegments, &[0x03]),
+            tlv(TlvTag::SarSegmentSeqnum, &[0x02]),
+            tlv(TlvTag::UserMessageReference, &[0x00, 0x07]),
+            tlv(TlvTag::MoreMessagesToSend, &[0x01]),
+            // network_error_code: network type + 2-octet code (§5.3.2.31).
+            tlv(TlvTag::NetworkErrorCode, &[0x03, 0x00, 0x1A]),
+        ];
+        assert_eq!(pdu.sar_msg_ref_num(), Some(0x1234));
+        assert_eq!(pdu.sar_total_segments(), Some(3));
+        assert_eq!(pdu.sar_segment_seqnum(), Some(2));
+        assert_eq!(pdu.user_message_reference(), Some(7));
+        assert_eq!(pdu.more_messages_to_send(), Some(1));
+        assert_eq!(pdu.network_error_code(), Some((3, 0x001A)));
+    }
+
+    #[test]
+    fn message_state_names_cover_the_3_4_range() {
+        // §5.2.28 codes paired with the Appendix B receipt spellings.
+        let expected = [
+            (1, "ENROUTE"),
+            (2, "DELIVRD"),
+            (3, "EXPIRED"),
+            (4, "DELETED"),
+            (5, "UNDELIV"),
+            (6, "ACCEPTD"),
+            (7, "UNKNOWN"),
+            (8, "REJECTD"),
+        ];
+        for (code, name) in expected {
+            assert_eq!(Receipt::message_state_name(code), Some(name));
+        }
+        // Outside the range we invent nothing.
+        assert_eq!(Receipt::message_state_name(0), None);
+        assert_eq!(Receipt::message_state_name(9), None);
+    }
+
+    #[test]
+    fn receipt_builds_from_tlvs_when_there_is_no_text_body() {
+        Python::attach(|py| {
+            // Some SMSCs send the spec form only: no id:/stat: body at all.
+            let mut dlr = make_pdu(0x04);
+            dlr.tlvs = vec![
+                tlv(TlvTag::ReceiptedMessageId, b"0a1b2\0"),
+                tlv(TlvTag::MessageStateTlv, &[2]),
+            ];
+            let d = dlr.receipt(py).expect("TLV-only receipt still parses");
+            let id: String = d.get_item("id").unwrap().unwrap().extract().unwrap();
+            assert_eq!(id, "0a1b2");
+            let stat: String = d.get_item("stat").unwrap().unwrap().extract().unwrap();
+            assert_eq!(stat, "DELIVRD");
+            let state: u8 = d
+                .get_item("message_state")
+                .unwrap()
+                .unwrap()
+                .extract()
+                .unwrap();
+            assert_eq!(state, 2);
+        });
+    }
+
+    #[test]
+    fn receipt_text_body_wins_over_disagreeing_tlvs() {
+        Python::attach(|py| {
+            // Interop runs on the text form, so it stays authoritative; the
+            // TLVs are still readable through their own accessors.
+            let mut dlr = make_pdu(0x04);
+            dlr.short_message = b"id:FROM_TEXT stat:EXPIRED".to_vec();
+            dlr.tlvs = vec![
+                tlv(TlvTag::ReceiptedMessageId, b"FROM_TLV\0"),
+                tlv(TlvTag::MessageStateTlv, &[2]),
+            ];
+            let d = dlr.receipt(py).expect("dict");
+            let id: String = d.get_item("id").unwrap().unwrap().extract().unwrap();
+            assert_eq!(id, "FROM_TEXT");
+            let stat: String = d.get_item("stat").unwrap().unwrap().extract().unwrap();
+            assert_eq!(stat, "EXPIRED");
+            // Not hidden: the raw TLVs stay reachable for a script that
+            // wants to prefer them.
+            assert_eq!(dlr.receipted_message_id().as_deref(), Some("FROM_TLV"));
+            assert_eq!(dlr.message_state(), Some(2));
+        });
+    }
+
+    #[test]
+    fn receipt_tlvs_fill_only_the_keys_the_text_omitted() {
+        Python::attach(|py| {
+            let mut dlr = make_pdu(0x04);
+            // Text has stat but no id; the TLV supplies the id.
+            dlr.short_message = b"stat:DELIVRD err:000".to_vec();
+            dlr.tlvs = vec![tlv(TlvTag::ReceiptedMessageId, b"0a1b2\0")];
+            let d = dlr.receipt(py).expect("dict");
+            let id: String = d.get_item("id").unwrap().unwrap().extract().unwrap();
+            assert_eq!(id, "0a1b2");
+            let stat: String = d.get_item("stat").unwrap().unwrap().extract().unwrap();
+            assert_eq!(stat, "DELIVRD");
+        });
+    }
+
+    #[test]
+    fn receipt_reads_a_body_delivered_via_message_payload() {
+        Python::attach(|py| {
+            // A receipt long enough to need the TLV still has to parse.
+            let mut dlr = make_pdu(0x04);
+            dlr.tlvs = vec![tlv(
+                TlvTag::MessagePayload,
+                b"id:0a1b2 stat:UNDELIV err:042",
+            )];
+            let d = dlr.receipt(py).expect("dict");
+            let id: String = d.get_item("id").unwrap().unwrap().extract().unwrap();
+            assert_eq!(id, "0a1b2");
+            let err: String = d.get_item("err").unwrap().unwrap().extract().unwrap();
+            assert_eq!(err, "042");
+        });
+    }
+
+    #[test]
+    fn receipt_stays_none_without_a_body_or_receipt_tlvs() {
+        Python::attach(|py| {
+            let mut dlr = make_pdu(0x04);
+            dlr.short_message = b"not receipt shaped".to_vec();
+            // A TLV that isn't one of the receipt ones doesn't conjure one.
+            dlr.tlvs = vec![tlv(TlvTag::SarMsgRefNum, &[0x12, 0x34])];
+            assert!(dlr.receipt(py).is_none());
+        });
+    }
+
+    #[test]
+    fn reply_tlvs_are_rejected_off_the_data_sm_path() {
+        Python::attach(|py| {
+            // submit_sm_resp has no optional parameters in 3.4. Silently
+            // dropping them would look like they went out.
+            let pdu = make_pdu(0x00);
+            let d = PyDict::new(py);
+            d.set_item("ADDITIONAL_STATUS_INFO_TEXT", "nope")
+                .expect("set");
+            let err = pdu
+                .reply("ESME_ROK".to_string(), None, Some(&d))
+                .expect_err("rejected");
+            assert!(err.is_instance_of::<PyValueError>(py));
+            assert!(err.to_string().contains("data_sm"));
+        });
+    }
+
+    #[test]
+    fn reply_tlvs_ride_along_on_the_data_sm_path() {
+        Python::attach(|py| {
+            let mut pdu = make_pdu(0x00);
+            pdu.command = "data_sm".into();
+            let d = PyDict::new(py);
+            d.set_item("DELIVERY_FAILURE_REASON", 1u8).expect("set");
+            let reply = pdu
+                .reply("ESME_RSUBMITFAIL".to_string(), None, Some(&d))
+                .expect("accepted");
+            assert_eq!(reply.tlvs.len(), 1);
+            assert_eq!(reply.tlvs[0].tag, TlvTag::DeliveryFailureReason as u16);
+            assert_eq!(reply.tlvs[0].value, vec![0x01]);
         });
     }
 

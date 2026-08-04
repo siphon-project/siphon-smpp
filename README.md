@@ -130,7 +130,7 @@ async def on_submit(pdu, session):
         bind="aggregator-eu",
         source_addr=pdu.source_addr,
         destination_addr=pdu.destination_addr,
-        short_message=pdu.short_message,        # bytes
+        short_message=pdu.body,                 # bytes; body, not short_message
         data_coding=pdu.data_coding,
         registered_delivery=pdu.registered_delivery,
     )
@@ -145,8 +145,10 @@ async def on_deliver(pdu, session):
         await smpp.deliver_to(session_id=esme_session,
                               source_addr=pdu.destination_addr,
                               destination_addr=pdu.source_addr,
-                              short_message=pdu.short_message,
-                              esm_class=0x04)    # delivery receipt
+                              short_message=pdu.body,
+                              esm_class=0x04,    # delivery receipt
+                              tlvs={"RECEIPTED_MESSAGE_ID": r["id"],
+                                    "MESSAGE_STATE": 2})
     return pdu.reply()                          # ESME_ROK ack
 ```
 
@@ -164,7 +166,21 @@ Key points:
   `is_tpdu`, …; `submit_sm_multi` carries the address list in `pdu.destinations`).
   For `deliver_sm`, `pdu.is_dlr` flags a delivery receipt and `pdu.receipt` is the
   parsed receipt dict (`id`, `stat`, `err`, `submit_date`, `done_date`, `text`,
-  `raw`).
+  `raw`, plus `message_state` when the TLV is present).
+- **Read the body with `pdu.body`, not `pdu.short_message`.** `short_message`
+  caps at 254 bytes (§5.2.21), so anything longer arrives in the
+  `message_payload` optional parameter instead, and a `data_sm` has no
+  `short_message` field at all — its body only ever exists there (§4.2.2).
+  `pdu.body` returns whichever the peer used.
+- **Optional parameters (TLVs)** are a dict keyed by spec name or raw integer
+  tag, on both directions:
+  `tlvs={"MESSAGE_PAYLOAD": long_body, "SAR_MSG_REF_NUM": 42, 0x1400: b"\x01"}`
+  for `submit_via` / `submit_multi_via` / `data_via` / `deliver_to` / `data_to`,
+  and `pdu.tlvs` / `pdu.tlv("SOURCE_PORT")` plus typed shortcuts
+  (`pdu.message_payload`, `pdu.receipted_message_id`, `pdu.message_state`,
+  `pdu.sar_msg_ref_num`, …) on the way in. Integer values are encoded at the
+  parameter's spec width, so `MESSAGE_STATE` is one octet and `SAR_MSG_REF_NUM`
+  two regardless of the number you pass.
 - **`Session`** carries `kind` (`"esme"` inbound / `"bind"` outbound),
   `session_id`, `system_id`, `client_addr`. `deliver_to` / `data_to` /
   `alert_to` target a bound ESME by `session_id`.
@@ -220,13 +236,13 @@ handler with a sensible default. Built on `smpp34` 1.2.
 | Helper | Direction | Backed by | |
 |---|---|---|---|
 | `submit_via` | → outbound bind | `smpp34` `SMSC::submit_sm` | ✅ |
-| `submit_multi_via` | → outbound bind | `SMSC::send_submit_sm_multi` | ✅ |
-| `data_via` | → outbound bind | `SMSC::send_data_sm` | ✅ |
+| `submit_multi_via` | → outbound bind | `SMSC::send_submit_sm_multi_pdu` | ✅ |
+| `data_via` | → outbound bind | `SMSC::send_data_sm_pdu` | ✅ |
 | `cancel_via` | → outbound bind | `SMSC::send_cancel_sm` | ✅ |
 | `query_via` | → outbound bind | `SMSC::send_query_sm` | ✅ |
 | `replace_via` | → outbound bind | `SMSC::send_replace_sm` | ✅ |
 | `deliver_to` | → bound ESME (`session_id`) | `ESME::send_deliver_sm` | ✅ |
-| `data_to` | → bound ESME | `ESME::send_data_sm` | ✅ |
+| `data_to` | → bound ESME | `ESME::send_data_sm_pdu` | ✅ |
 | `alert_to` | → bound ESME | `ESME::send_alert_notification` | ✅ |
 
 ---

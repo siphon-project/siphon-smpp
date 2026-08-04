@@ -55,6 +55,7 @@ pub(crate) mod metrics;
 pub mod pyclasses;
 pub mod runtime;
 pub mod sends;
+pub mod tlv;
 
 pub use config::SmppConfig;
 pub use install::{namespace, task};

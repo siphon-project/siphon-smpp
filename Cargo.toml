@@ -1,6 +1,6 @@
 [package]
 name = "siphon-smpp"
-version = "1.3.1"
+version = "1.4.0"
 edition = "2021"
 rust-version = "1.80"
 description = "SMPP 3.4 addon for siphon — exposes a scriptable `smpp` namespace to Python"
@@ -25,7 +25,7 @@ default = []
 [dependencies]
 # SMPP 3.4 wire codec + async client/server: smpp34, provided by
 # Real Time Telecom B.V. — https://github.com/Real-Time-Telecom-B-V/smpp34
-smpp34 = "1.2.1"
+smpp34 = "1.3.0"
 # Canonical repo URL after the siphon → siphon-sip rename. The URL string must
 # match byte-for-byte across every crate that depends on siphon-sip in one build
 # graph (e.g. siphon-bin), or cargo resolves two separate copies. branch=main

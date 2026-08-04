@@ -7,6 +7,83 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.4.0] — 2026-08-04
+
+### Added
+
+- **Optional parameters (TLVs) can be read and written from a script.** They are
+  a dict keyed by the SMPP 3.4 spec name or by a raw integer tag for
+  vendor-specific ones —
+  `tlvs={"MESSAGE_PAYLOAD": b"…", "SAR_MSG_REF_NUM": 42, 0x1400: b"\x01"}` — on
+  `submit_via`, `submit_multi_via`, `data_via`, `deliver_to` and `data_to`.
+  Values encode explicitly: `bytes` go on the wire verbatim, `str` becomes a
+  NUL-terminated C-Octet-String (§3.2.1.1), and `int` is encoded at the
+  parameter's *spec* width, so `MESSAGE_STATE` is one octet and
+  `SAR_MSG_REF_NUM` two whatever number you pass. A tag that isn't
+  integer-typed rejects an `int` rather than guessing a width and putting a
+  malformed TLV on the wire.
+
+  Inbound, `Pdu` gained `tlvs` (`{tag: bytes}`), `tlv(name_or_tag)`, and typed
+  shortcuts: `message_payload`, `receipted_message_id`, `message_state`,
+  `user_message_reference`, `sar_msg_ref_num`, `sar_total_segments`,
+  `sar_segment_seqnum`, `more_messages_to_send`, `network_error_code`.
+
+  This is what makes three things possible that weren't: messages past the
+  254-byte `short_message` limit, concatenation via the `sar_*` parameters, and
+  delivery receipts carrying `receipted_message_id` / `message_state` rather
+  than only the de-facto text body.
+- **`pdu.body`** — `message_payload` when the peer used it, `short_message`
+  otherwise. The two are mutually exclusive (§5.3.2.32) and which one arrives is
+  the sender's choice, so a handler reading `short_message` directly drops every
+  long message and every `data_sm`. The wire fields are still exposed unchanged;
+  nothing is synthesized into `short_message`.
+- **`pdu.reply(tlvs={…})` on the `data_sm` path**, landing on `data_sm_resp` —
+  the one SMPP 3.4 response PDU with optional parameters (§4.2.3:
+  `delivery_failure_reason`, `network_error_code`,
+  `additional_status_info_text`, `dpf_result`). So a rejection reason can travel
+  with the rejection. Used elsewhere it raises instead of dropping them.
+- `pdu.receipt` now falls back to `receipted_message_id` (0x001E) and
+  `message_state` (0x0427), and reports the numeric code as `message_state`. A
+  receipt sent only as TLVs, with no `id:`/`stat:` body at all, parses. Where
+  both are present the text body wins and the TLVs fill the gaps: interop runs
+  on the text form and SMSCs populate the TLVs inconsistently, so existing
+  receipts keep parsing exactly as they did. Both stay readable.
+
+### Fixed
+
+- **Every `data_sm` was empty in both directions.** A `data_sm` has no
+  `short_message` field — its message exists only as the `message_payload`
+  optional parameter (§4.2.2) — and until `smpp34` 1.3.0 the PDU had no `tlvs`
+  field at all. So `data_via` / `data_to` took no message argument and could not
+  have carried one, and `Pdu::from_data` hardcoded an empty body. Both now take
+  `short_message=`, which is folded into `message_payload` on the way out and
+  read back out of it on the way in. Supplying both `short_message=` and an
+  explicit `MESSAGE_PAYLOAD` raises rather than silently picking one.
+- **Inbound `alert_notification` reached handlers as garbage**, via `smpp34`
+  1.3.0. Its `decode` parsed from byte 0 while the read loop hands it a complete
+  PDU, so every field was 16 bytes off — `source_addr_ton` came out of
+  `command_length` and the addresses were shredded — and it did so without
+  erroring, which is why it went unnoticed. `ms_availability_status` was also
+  written as a bare octet rather than TLV 0x0422 (§4.12.1); the bare form is
+  still accepted on decode for peers on smpp34 ≤ 1.2.1. Guarded here by
+  hand-written wire vectors for both forms.
+- **A long `short_message` from a script panicked the SMPP runtime.** smpp34's
+  `submit_sm` / `deliver_sm` / `submit_sm_multi` / `replace_sm` constructors
+  `assert!` on the 254-byte limit, and script input reached them unchecked, so
+  a 255-byte body took down the tokio task instead of failing the call. The send
+  helpers now raise a `ValueError` pointing at `MESSAGE_PAYLOAD` (and at nothing,
+  for `replace_sm`, which has no optional parameters to fall back on). Same for
+  `submit_sm_multi` past 254 destinations.
+
+### Changed
+
+- **`smpp34` to 1.3.0.**
+- `examples/gateway.py` relays the body with `pdu.body`, carries the `sar_*`
+  concatenation parameters across the hop (dropping them turns one message into
+  fragments the far end cannot reassemble), attaches `RECEIPTED_MESSAGE_ID` +
+  `MESSAGE_STATE` to the receipts it routes back — remapped to the gateway's own
+  message id, not the upstream one — and gained a `data_sm` handler.
+
 ## [1.3.1] — 2026-07-27
 
 ### Fixed

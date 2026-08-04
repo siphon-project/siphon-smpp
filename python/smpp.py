@@ -26,15 +26,55 @@ Send helpers (all async — `await` them):
   Outbound, target a bind by name:
     * submit_via(bind=…, source_addr=…, destination_addr=…, short_message=…, **fields)
     * submit_multi_via(bind=…, source_addr=…, destinations=[…], short_message=…, **fields)
-    * data_via(bind=…, source_addr=…, destination_addr=…, **fields)
+    * data_via(bind=…, source_addr=…, destination_addr=…, short_message=…, **fields)
     * cancel_via(bind=…, message_id=…, **fields)
     * query_via(bind=…, message_id=…, **fields) -> QueryResp
     * replace_via(bind=…, message_id=…, short_message=…, **fields)
   Inbound, target a bound ESME by session_id:
     * deliver_to(session_id=…, source_addr=…, destination_addr=…, short_message=…, **fields)
-    * data_to(session_id=…, source_addr=…, destination_addr=…, **fields)
+    * data_to(session_id=…, source_addr=…, destination_addr=…, short_message=…, **fields)
     * alert_to(session_id=…, source_addr=…, esme_addr=…, **fields)
 All are attached as Rust pyfunctions at namespace-init time.
+
+Optional parameters (TLVs, SMPP 3.4 §3.2.1 / §5.3.2)
+----------------------------------------------------
+submit_via, submit_multi_via, data_via, deliver_to and data_to all take
+`tlvs=` — a dict keyed by the spec name or by a raw integer tag for
+vendor-specific parameters:
+
+    tlvs={"MESSAGE_PAYLOAD": b"...", "SAR_MSG_REF_NUM": 42, 0x1400: b"\\x01"}
+
+Values: `bytes` go on the wire verbatim; a `str` is NUL-terminated into a
+C-Octet-String (what RECEIPTED_MESSAGE_ID and friends require); an `int`
+is encoded at the parameter's *spec* width, so MESSAGE_STATE is one octet
+and SAR_MSG_REF_NUM is two whatever number you pass. A tag that isn't
+integer-typed rejects an int rather than guessing a width.
+
+Three things this is for:
+  * Messages over 254 bytes. `short_message` is capped there (§5.2.21) and
+    a longer one now raises instead of panicking the runtime — send it as
+    MESSAGE_PAYLOAD with `short_message=b""`.
+  * Concatenation: SAR_MSG_REF_NUM / SAR_TOTAL_SEGMENTS / SAR_SEGMENT_SEQNUM.
+  * Spec delivery receipts: RECEIPTED_MESSAGE_ID + MESSAGE_STATE alongside
+    (or instead of) the text receipt body.
+
+`data_sm` has no `short_message` field at all — its body exists only as
+MESSAGE_PAYLOAD (§4.2.2) — so `short_message=` on data_via / data_to is
+carried there for you. Passing both that and an explicit MESSAGE_PAYLOAD
+raises rather than silently picking one.
+
+Reading them back, on any `Pdu`:
+  * pdu.body                  — MESSAGE_PAYLOAD if present, else
+                                short_message. **Use this, not
+                                short_message**, or you drop long messages
+                                and every data_sm body.
+  * pdu.tlvs                  — {tag_int: bytes}, every parameter decoded
+  * pdu.tlv("SOURCE_PORT")    — one value, by name or by int tag; None if absent
+  * pdu.message_payload, pdu.receipted_message_id, pdu.message_state,
+    pdu.user_message_reference, pdu.sar_msg_ref_num,
+    pdu.sar_total_segments, pdu.sar_segment_seqnum,
+    pdu.more_messages_to_send, pdu.network_error_code — typed shortcuts,
+    None when the PDU didn't carry the parameter.
 
 Pyclasses (`Pdu`, `PduReply`, `Session`, `Bind`, `BindResult`,
 `AlertNotification`, `SmppResp`, `QueryResp`) are attached to the module
@@ -85,6 +125,7 @@ def on_pdu(command):
                                (pdu.destinations is the address list)
       * "deliver_sm"         — MT / MO / **DLR** from an outbound bind
       * "data_sm"            — TLV-based message, either direction
+                               (body in pdu.body, never pdu.short_message)
       * "cancel_sm"          — cancel request from an inbound ESME
                                (pdu.message_id + addressing)
       * "query_sm"           — message-state query from an inbound ESME
@@ -102,9 +143,19 @@ def on_pdu(command):
         — query_sm success (message_state 1=ENROUTE … 8=REJECTED)
       * `None` — same as bare `pdu.reply()`
 
+    On the "data_sm" path only, `pdu.reply(tlvs={...})` puts optional
+    parameters on the response — `data_sm_resp` is the one SMPP 3.4
+    response PDU that has any (§4.2.3: DELIVERY_FAILURE_REASON,
+    NETWORK_ERROR_CODE, ADDITIONAL_STATUS_INFO_TEXT, DPF_RESULT). Using it
+    elsewhere raises rather than dropping them.
+
     For "deliver_sm", check `pdu.is_dlr`; if set, `pdu.receipt` is the
     parsed delivery-receipt dict (id, stat, err, …) — route it back to
-    the originating ESME with `await smpp.deliver_to(...)`.
+    the originating ESME with `await smpp.deliver_to(...)`. The text body
+    is parsed first and wins; RECEIPTED_MESSAGE_ID / MESSAGE_STATE fill in
+    `id` / `stat` when the text didn't carry them, and the numeric code
+    shows up as `message_state`. A receipt sent only as TLVs, with no text
+    body at all, still parses.
 
     The Rust dispatcher matches on `options.command`.
     """
@@ -169,6 +220,9 @@ def routing_rules():
 #
 #   Pdu               — passed into @on_pdu handlers; fields + .message_id
 #                        + .reply() / .reply_query() + .is_dlr / .receipt
+#                        + .body / .tlvs / .tlv(tag) and the TLV shortcuts
+#                        (.message_payload, .receipted_message_id,
+#                         .message_state, .sar_* …)
 #   PduReply          — what .reply() / .reply_query() return (you usually
 #                        don't construct these directly)
 #   Session           — passed into @on_pdu / @on_session;
