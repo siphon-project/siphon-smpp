@@ -458,20 +458,24 @@ impl SmppServerListener for State {
                 metrics::record_pdu(metrics::INBOUND, "data_sm", metrics::REJECTED);
                 request.reject(SmppError::ESME_RSYSERR)
             }
-            Some(Ok(reply)) => match reply.message_id {
-                Some(id) => {
-                    metrics::record_pdu(metrics::INBOUND, "data_sm", metrics::ACCEPTED);
-                    request.accept(id)
-                }
-                None if reply.command_status == SmppError::ESME_ROK => {
-                    metrics::record_pdu(metrics::INBOUND, "data_sm", metrics::ACCEPTED);
-                    request.accept(String::new())
-                }
-                None => {
-                    metrics::record_pdu(metrics::INBOUND, "data_sm", metrics::REJECTED);
-                    request.reject(reply.command_status)
-                }
-            },
+            Some(Ok(reply)) => {
+                let tlvs = reply.tlvs.clone();
+                let resp = match reply.message_id {
+                    Some(id) => {
+                        metrics::record_pdu(metrics::INBOUND, "data_sm", metrics::ACCEPTED);
+                        request.accept(id)
+                    }
+                    None if reply.command_status == SmppError::ESME_ROK => {
+                        metrics::record_pdu(metrics::INBOUND, "data_sm", metrics::ACCEPTED);
+                        request.accept(String::new())
+                    }
+                    None => {
+                        metrics::record_pdu(metrics::INBOUND, "data_sm", metrics::REJECTED);
+                        request.reject(reply.command_status)
+                    }
+                };
+                with_resp_tlvs(resp, tlvs)
+            }
             Some(Err(e)) => {
                 tracing::error!(target: "siphon_smpp",
                     error=%e, "@smpp.on_pdu(data_sm) raised");
@@ -798,11 +802,12 @@ impl SmppClientListener for BindListener {
             }
             Some(Ok(reply)) if reply.command_status == SmppError::ESME_ROK => {
                 metrics::record_pdu(metrics::EGRESS, "data_sm", metrics::ACCEPTED);
-                request.accept(reply.message_id.unwrap_or_default())
+                let tlvs = reply.tlvs.clone();
+                with_resp_tlvs(request.accept(reply.message_id.unwrap_or_default()), tlvs)
             }
             Some(Ok(reply)) => {
                 metrics::record_pdu(metrics::EGRESS, "data_sm", metrics::REJECTED);
-                request.reject(reply.command_status)
+                with_resp_tlvs(request.reject(reply.command_status), reply.tlvs)
             }
             Some(Err(e)) => {
                 tracing::error!(target: "siphon_smpp",
@@ -904,6 +909,17 @@ impl BindListener {
 }
 
 // ── Dispatch helpers ────────────────────────────────────────────────────
+
+/// Attach a handler's `reply(tlvs=…)` optional parameters to a
+/// `data_sm_resp`. `data_sm_resp` is the only 3.4 response PDU that carries
+/// any (§4.2.3), which is why nothing else goes through here.
+/// `command_length` is recomputed at encode time, so order doesn't matter.
+fn with_resp_tlvs(mut resp: data_sm_resp, tlvs: Vec<smpp34::Tlv>) -> data_sm_resp {
+    for tlv in tlvs {
+        resp.push_tlv(tlv);
+    }
+    resp
+}
 
 /// Dispatch a PDU to its `@smpp.on_pdu("<command>")` handler. If no
 /// handler matches, default to a soft `ESME_ROK` accept so the wire ack
@@ -1145,6 +1161,55 @@ async fn dispatch_bind(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn a_data_sm() -> data_sm {
+        data_sm::new(
+            42,
+            String::new(),
+            1,
+            1,
+            "5550100".into(),
+            1,
+            1,
+            "5550199".into(),
+            0,
+            0,
+            0,
+        )
+    }
+
+    #[test]
+    fn reply_tlvs_reach_the_data_sm_resp_wire_image() {
+        // A rejection reason that only reaches our own log is worse than
+        // useless, so assert the TLV is really in the encoded response —
+        // command_length included, or the peer truncates it away.
+        let resp = with_resp_tlvs(
+            a_data_sm().reject(SmppError::ESME_RSUBMITFAIL),
+            vec![smpp34::Tlv::from_u8(
+                smpp34::TlvTag::DeliveryFailureReason,
+                1,
+            )],
+        );
+        let wire = resp.encode();
+
+        // §3.2.1: tag 0x0425, length 0x0001, value 0x01.
+        let expected_tlv = [0x04u8, 0x25, 0x00, 0x01, 0x01];
+        assert!(
+            wire.windows(expected_tlv.len()).any(|w| w == expected_tlv),
+            "delivery_failure_reason TLV missing from {wire:02x?}"
+        );
+        // command_length must cover it, otherwise the peer stops reading
+        // before the optional parameters.
+        let command_length = u32::from_be_bytes([wire[0], wire[1], wire[2], wire[3]]);
+        assert_eq!(command_length as usize, wire.len());
+    }
+
+    #[test]
+    fn no_reply_tlvs_leaves_the_response_untouched() {
+        let bare = a_data_sm().accept("abc".into()).encode();
+        let through = with_resp_tlvs(a_data_sm().accept("abc".into()), Vec::new()).encode();
+        assert_eq!(bare, through);
+    }
 
     #[tokio::test]
     async fn rate_limiter_paces_to_configured_rate() {

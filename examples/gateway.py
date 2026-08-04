@@ -118,6 +118,78 @@ def _pick_bind(destination_addr):
     return configured[0]["name"] if configured else None
 
 
+# ── Optional parameters (TLVs) ──────────────────────────────────────────
+
+# short_message is one length octet plus at most 254 octets (§5.2.21).
+# Longer bodies live in the MESSAGE_PAYLOAD optional parameter instead;
+# the two are mutually exclusive (§5.3.2.32).
+SHORT_MESSAGE_MAX = 254
+
+# Parameters worth carrying across a relay hop unchanged. The sar_* trio
+# is what makes a long message reassemblable at the far end; dropping it
+# turns one message into unordered fragments. The rest are the ESME's own
+# addressing/reference metadata, which the upstream SMSC echoes back on
+# the receipt.
+RELAYED_TLVS = (
+    "SAR_MSG_REF_NUM",
+    "SAR_TOTAL_SEGMENTS",
+    "SAR_SEGMENT_SEQNUM",
+    "MORE_MESSAGES_TO_SEND",
+    "USER_MESSAGE_REFERENCE",
+    "SOURCE_PORT",
+    "DESTINATION_PORT",
+    "PRIVACY_INDICATOR",
+    "PAYLOAD_TYPE",
+)
+
+
+# The receipt text's state spelling (Appendix B) mapped back to the
+# MESSAGE_STATE code (§5.2.28), so a relayed DLR carries both forms.
+MESSAGE_STATES = {
+    "ENROUTE": 1,
+    "DELIVRD": 2,
+    "EXPIRED": 3,
+    "DELETED": 4,
+    "UNDELIV": 5,
+    "ACCEPTD": 6,
+    "UNKNOWN": 7,
+    "REJECTD": 8,
+}
+
+
+def _message_state(stat):
+    """MESSAGE_STATE code for a receipt `stat:`, or None if unrecognised.
+
+    Returning None rather than a default keeps an SMSC's non-standard
+    spelling from being reported to the ESME as a state it isn't.
+    """
+    return MESSAGE_STATES.get((stat or "").strip().upper())
+
+
+def _relay_kwargs(pdu, extra_tlvs=None):
+    """Body + optional parameters for relaying `pdu` to the next hop.
+
+    `pdu.body` reads MESSAGE_PAYLOAD when the peer used it and
+    short_message otherwise, so this handles both without the caller
+    caring which the sender picked.
+    """
+    tlvs = {}
+    for name in RELAYED_TLVS:
+        value = pdu.tlv(name)
+        if value is not None:
+            tlvs[name] = value
+    if extra_tlvs:
+        tlvs.update(extra_tlvs)
+
+    body = pdu.body
+    if len(body) > SHORT_MESSAGE_MAX:
+        # short_message can't hold it; MESSAGE_PAYLOAD is the only field
+        # that can. Passing both would be rejected, so the body moves.
+        tlvs["MESSAGE_PAYLOAD"] = body
+        body = b""
+    return {"short_message": body, "tlvs": tlvs}
+
+
 # ── MO: submit_sm from an inbound ESME ──────────────────────────────────
 
 @smpp.on_pdu("submit_sm")
@@ -140,10 +212,15 @@ async def on_submit(pdu, session):
             destination_addr=pdu.destination_addr,
             dest_addr_ton=pdu.dest_addr_ton,
             dest_addr_npi=pdu.dest_addr_npi,
-            short_message=pdu.short_message,
             esm_class=pdu.esm_class,
             data_coding=pdu.data_coding,
             registered_delivery=pdu.registered_delivery,
+            # Body + the optional parameters worth forwarding. Reading
+            # pdu.short_message directly here would drop every long or
+            # MESSAGE_PAYLOAD-carried message, and dropping the sar_*
+            # trio would turn one concatenated message into loose
+            # fragments the far end can't reassemble.
+            **_relay_kwargs(pdu),
         )
     except Exception as e:  # bind not up, upstream nack, timeout, …
         log.error(f"submit via {bind} failed: {e}")
@@ -181,6 +258,9 @@ async def on_deliver(pdu, session):
 
 
 async def _route_dlr(pdu, session):
+    # `pdu.receipt` parses the text body first and falls back to
+    # RECEIPTED_MESSAGE_ID / MESSAGE_STATE, so an upstream that sends the
+    # spec form only (no id:/stat: body) correlates just the same.
     receipt = pdu.receipt or {}
     upstream_id = receipt.get("id", "")
     raw = json.loads(await cache.get(f"dlr:{session.system_id}:{upstream_id}") or "null")
@@ -198,6 +278,14 @@ async def _route_dlr(pdu, session):
         f"text:{receipt.get('text', '')}"
     ).encode()
 
+    # …and the spec optional parameters carrying the same facts (§4.5.0):
+    # RECEIPTED_MESSAGE_ID must be OUR id too, not the upstream one, or an
+    # ESME that trusts the TLV over the text body correlates to nothing.
+    receipt_tlvs = {"RECEIPTED_MESSAGE_ID": raw["our_id"]}
+    state = _message_state(receipt.get("stat"))
+    if state is not None:
+        receipt_tlvs["MESSAGE_STATE"] = state
+
     try:
         await smpp.deliver_to(
             session_id=esme_session,
@@ -205,6 +293,7 @@ async def _route_dlr(pdu, session):
             destination_addr=raw["source_addr"],
             short_message=body,
             esm_class=0x04,  # delivery receipt
+            tlvs=receipt_tlvs,
         )
         log.info(f"DLR routed to {raw['esme_system']}: {receipt.get('stat')}")
     except Exception as e:
@@ -233,13 +322,59 @@ async def _route_mo_reply(pdu, session):
             source_addr_ton=pdu.source_addr_ton,
             source_addr_npi=pdu.source_addr_npi,
             destination_addr=pdu.destination_addr,
-            short_message=pdu.short_message,
             esm_class=pdu.esm_class,
             data_coding=pdu.data_coding,
+            **_relay_kwargs(pdu),
         )
         log.info(f"MO {pdu.source_addr} -> {pdu.destination_addr} delivered to {owner}")
     except Exception as e:
         log.error(f"MO delivery to {owner} failed: {e}")
+
+
+# ── data_sm from an inbound ESME ────────────────────────────────────────
+
+@smpp.on_pdu("data_sm")
+async def on_data(pdu, session):
+    # data_sm is the TLV-based alternative to submit_sm. It has no
+    # short_message field at all — the body is the MESSAGE_PAYLOAD
+    # optional parameter (§4.2.2) — so `pdu.body` is the only way to read
+    # it. Reading pdu.short_message here would always give you b"".
+    bind = _pick_bind(pdu.destination_addr)
+    if bind is None:
+        log.error(f"no route for {pdu.destination_addr}")
+        return pdu.reply(command_status="ESME_RINVDSTADR")
+
+    try:
+        await smpp.data_via(
+            bind=bind,
+            source_addr=pdu.source_addr,
+            source_addr_ton=pdu.source_addr_ton,
+            source_addr_npi=pdu.source_addr_npi,
+            destination_addr=pdu.destination_addr,
+            dest_addr_ton=pdu.dest_addr_ton,
+            dest_addr_npi=pdu.dest_addr_npi,
+            esm_class=pdu.esm_class,
+            data_coding=pdu.data_coding,
+            registered_delivery=pdu.registered_delivery,
+            # data_via folds short_message into MESSAGE_PAYLOAD for us,
+            # so the same relay helper works whatever the body's length.
+            **_relay_kwargs(pdu),
+        )
+    except Exception as e:
+        log.error(f"data_sm via {bind} failed: {e}")
+        # data_sm_resp is the one SMPP 3.4 response PDU with optional
+        # parameters, so the reason travels with the rejection instead of
+        # only reaching our own log.
+        return pdu.reply(
+            command_status="ESME_RSUBMITFAIL",
+            tlvs={"ADDITIONAL_STATUS_INFO_TEXT": "upstream relay failed"},
+        )
+
+    log.info(
+        f"data_sm {session.system_id}: {pdu.source_addr} -> "
+        f"{pdu.destination_addr} via {bind} ({len(pdu.body)} bytes)"
+    )
+    return pdu.reply()
 
 
 # ── alert_notification from an outbound bind ────────────────────────────
