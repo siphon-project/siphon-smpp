@@ -3106,8 +3106,8 @@ dependencies = [
 
 [[package]]
 name = "siphon-sip"
-version = "1.5.0"
-source = "git+https://github.com/siphon-project/siphon-sip?branch=main#be367be6131d375b40c5a25b3953c4071234215c"
+version = "1.5.1"
+source = "git+https://github.com/siphon-project/siphon-sip?branch=main#56ca10add74c14c5234546586dfd5d1b5017d343"
 dependencies = [
  "aes",
  "arc-swap",
