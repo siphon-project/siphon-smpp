@@ -80,3 +80,19 @@ jobs:
         run: pip install "siphon-sip @ git+https://github.com/siphon-project/siphon-sip@main#subdirectory=sdk"
       - name: Check SDK mock parity
         run: python scripts/check_sdk_parity.py
+
+  deny:
+    # The deterministic half of cargo-deny. bans / licenses / sources are a pure
+    # function of the dependency graph: they only change when a dependency
+    # changes, so they gate every PR and fail on the PR that caused them — one
+    # that pulls in a copyleft license, adds a git source outside the allow-list,
+    # or blows up the duplicate-crate count. The time-varying half (RustSec
+    # advisories, which can go red against an untouched dependency) is not a PR
+    # gate; it runs on a schedule in audit.yml.
+    name: cargo-deny (bans/licenses/sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check bans licenses sources

@@ -1,8 +1,13 @@
-# .github/workflows/audit.yml — RustSec advisory + license/source policy.
+# .github/workflows/audit.yml — RustSec advisory watch.
 #
-# RustSec advisories are time-varying: a new advisory can land against an
-# unchanged dependency, so this runs on a schedule (and whenever the dependency
-# set changes) rather than gating every PR.
+# This is the time-varying half of cargo-deny: a new advisory can land against
+# a dependency nobody touched, so a failure here is not the fault of whatever
+# PR happens to be open. It runs weekly (and on main whenever the dependency
+# set changes) and reports by opening a tracking issue — it never gates a
+# feature PR.
+#
+# The deterministic half (bans / licenses / sources — a pure function of the
+# dependency graph) does gate every PR, in the `deny` job of ci.yaml.
 name: Security audit
 
 on:
@@ -18,13 +23,40 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 jobs:
-  cargo-deny:
-    name: cargo-deny
+  advisories:
+    name: cargo-deny (advisories)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
-          command: check
+          command: check advisories
+
+      - name: Report on a tracking issue
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: "cargo-deny: RustSec advisory check is failing"
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          body=$(cat <<'EOF'
+          `cargo deny check advisories` failed. Advisories are time-varying, so
+          this is not tied to any one change: a new RustSec entry can land
+          against a dependency that has not moved.
+
+          Fix by bumping the affected dependency, or by adding a justified
+          `ignore` entry to `deny.toml`.
+          EOF
+          )
+          body="$body
+
+          Run: $RUN_URL (ref $GITHUB_REF_NAME, commit $GITHUB_SHA)"
+          existing=$(gh issue list --state open --search "$TITLE in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$TITLE" --body "$body"
+          fi
