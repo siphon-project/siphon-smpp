@@ -7,6 +7,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.5.0] — 2026-08-18
+
+### Fixed
+
+- **A listening socket we never got was reported as "SMPP server listening".**
+  The server task logged that line *before* calling `SmppServer::start`, then
+  parked on `pending::<()>()` for the process lifetime. Under `smpp34` ≤ 1.3.0 a
+  failed bind panicked a tokio worker; 1.4.0 turns it into the defaulted
+  `SmppServerListener::on_listen_failed`, which we did not implement, so a port
+  already in use, a privileged port, or an address the host does not own would
+  have left us parked forever claiming to serve while accepting nothing. We now
+  implement the hook, log the cause at `error!`, and the task returns instead of
+  parking. The "listening" line moved after `start()`, which as of 1.4.0 means
+  the socket is actually accepting.
+- **A refused outbound connect cost the full 15-second bind deadline, every
+  retry, and was reported as a timeout it never was.** A connect that fails
+  starts no session, so `is_alive()` could never flip and the supervisor polled
+  it out to `bind_deadline` before backing off — then logged "bind did not
+  complete within 15s" with no cause. `SmppClientListener::on_connection_failed`
+  (new in 1.4.0) now logs the real reason (`TCP connect to … failed: Connection
+  refused`), counts it, and ends the wait at once, so backoff starts on the
+  failure rather than 15 seconds after it.
+
+### Added
+
+- `siphon_smpp_bind_connect_failures_total{bind}` — outbound bind attempts that
+  never reached a session. Deliberately separate from
+  `siphon_smpp_bind_reconnects_total`, which counts an *established* session
+  dropping: a peer refusing connections outright and one that keeps dropping
+  healthy sessions are different faults and shouldn't share a series.
+
+### Changed
+
+- **`smpp34` to 1.4.0** — a robustness release that takes `src/` from 50
+  production `.unwrap()`/`.expect()` calls to zero, several reachable straight
+  from the wire. The ones that could have reached us: `get_error()` panicked on
+  any `command_status` outside the enum, though §5.1.3 leaves 0x400–0x4FF
+  vendor-specific and real SMSCs use it; the response timers keyed on
+  `SystemTime`, so an NTP step backwards skewed or panicked them; and writing a
+  rejection to a peer that had already gone panicked the session. No signature
+  or documented guarantee changed.
+- Dependency bumps merged ahead of this: `siphon-sip` to 1.5.1, and the
+  cargo-minor-patch group (pyo3 0.29.0 → 0.29.2, thiserror 2.0.19 → 2.0.20,
+  proc-macro2 0.1.91 → 0.1.92).
+
 ## [1.4.0] — 2026-08-04
 
 ### Added

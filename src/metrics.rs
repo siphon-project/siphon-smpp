@@ -37,6 +37,7 @@ const RECONNECTS: &str = "siphon_smpp_bind_reconnects_total";
 const DISPATCH_ERRORS: &str = "siphon_smpp_dispatch_errors_total";
 const DISPATCH_DURATION: &str = "siphon_smpp_dispatch_duration_seconds";
 const BIND_REQUESTS: &str = "siphon_smpp_bind_requests_total";
+const CONNECT_FAILURES: &str = "siphon_smpp_bind_connect_failures_total";
 
 // ── Label values (shared so call sites can't typo a label) ───────────────
 
@@ -131,6 +132,15 @@ fn register_all(cm: &CustomMetrics) {
         ),
         BIND_REQUESTS,
     );
+    note(
+        cm.register_counter(
+            CONNECT_FAILURES,
+            "Outbound SMPP bind attempts that never reached a session \
+             (TCP connect, TLS handshake or socket setup failed)",
+            &["bind"],
+        ),
+        CONNECT_FAILURES,
+    );
 }
 
 // ── Inline emit helpers (no-op when the host metrics engine is absent) ────
@@ -176,6 +186,18 @@ pub(crate) fn record_throttled(direction: &str) {
 pub(crate) fn record_bind_reconnect(bind: &str) {
     if let Some(cm) = store() {
         let _ = cm.counter_inc(RECONNECTS, &[("bind", bind)], 1.0);
+    }
+}
+
+/// Count an outbound bind attempt that never reached a session: the TCP
+/// connect, the TLS handshake or the socket setup failed, so no bind was
+/// ever sent. Distinct from [`record_bind_reconnect`], which counts an
+/// *established* session dropping — a peer that is refusing connections
+/// outright and one that keeps dropping healthy sessions are different
+/// faults and shouldn't share a series.
+pub(crate) fn record_bind_connect_failure(bind: &str) {
+    if let Some(cm) = store() {
+        let _ = cm.counter_inc(CONNECT_FAILURES, &[("bind", bind)], 1.0);
     }
 }
 

@@ -26,6 +26,7 @@
 //! `handlers_for(...)`), so a hot-reloaded script is picked up on the
 //! next PDU.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Instant;
 
@@ -62,6 +63,11 @@ pub(crate) struct State {
     /// What to do when an inbound submit exceeds `inbound_max_mps`:
     /// pace (delay the resp) or reject with `ESME_RTHROTTLED`.
     pub inbound_throttle_action: ThrottleAction,
+    /// Set by [`SmppServerListener::on_listen_failed`] when the listening
+    /// socket could not be bound. Terminal: no connection is ever accepted
+    /// after it, so the server task reports it and stops instead of parking
+    /// as though it were listening.
+    pub listen_failure: OnceLock<String>,
     pub script: ScriptHandle,
 }
 
@@ -183,6 +189,7 @@ pub fn spawn(cfg: SmppConfig, script: ScriptHandle) {
         esmes: Mutex::new(Vec::new()),
         inbound_max_mps: cfg.server.max_msg_per_sec,
         inbound_throttle_action: cfg.server.throttle_action,
+        listen_failure: OnceLock::new(),
         script: script.clone(),
     });
     if STATE.set(state.clone()).is_err() {
@@ -209,6 +216,7 @@ pub fn spawn(cfg: SmppConfig, script: ScriptHandle) {
     let inactivity = cfg.server.inactivity_timer_ms;
     let response = cfg.server.response_timer_ms;
     let log_host = host.clone();
+    let server_state = state.clone();
     handle.spawn(async move {
         let mut server = SmppServer::new_with_default_timers(
             listen_addr,
@@ -220,9 +228,21 @@ pub fn spawn(cfg: SmppConfig, script: ScriptHandle) {
             response,
             1500,
         );
+        server.start().await;
+        // As of smpp34 1.4.0 `start()` binds the listening socket before it
+        // returns, so by here the server is either accepting or has told us
+        // through `on_listen_failed` why it never will. Logging "listening"
+        // before the call — as this did — could claim a port we never got.
+        if let Some(error) = server_state.listen_failure.get() {
+            tracing::error!(target: "siphon_smpp",
+                host=%log_host, port=port, error=%error,
+                "SMPP server could not listen; inbound binds are DOWN for this process");
+            // Terminal: no connection will ever be accepted. Return rather
+            // than parking forever pretending to serve.
+            return;
+        }
         tracing::info!(target: "siphon_smpp",
             host=%log_host, port=port, "SMPP server listening");
-        server.start().await;
         // SmppServer::start spawns its accept loop in a child task and
         // returns; if we drop `server` here its Drop impl stops the
         // accept loop. Keep the wrapper alive for the runtime's
@@ -237,6 +257,22 @@ pub fn spawn(cfg: SmppConfig, script: ScriptHandle) {
             run_bind_loop(st, bind).await;
         });
     }
+}
+
+/// Should the bind supervisor keep waiting for an attempt to resolve?
+///
+/// Three ways out, and the middle one is the reason this is a function:
+/// the session came up, the connect failed outright, or the deadline ran
+/// out. A refused connect starts no session at all, so `is_alive()` can
+/// never flip for it — waiting on the deadline alone costs the full
+/// `bind_deadline` on every retry against a peer that is simply down.
+fn awaiting_bind(
+    alive: bool,
+    connect_failed: bool,
+    waited: std::time::Duration,
+    deadline: std::time::Duration,
+) -> bool {
+    !alive && !connect_failed && waited < deadline
 }
 
 /// Per-bind supervisor: bind, run until disconnect, reconnect after
@@ -259,10 +295,14 @@ async fn run_bind_loop(state: Arc<State>, cfg: BindConfig) {
         "receiver" => BIND_TYPE::RX,
         _ => BIND_TYPE::TRX,
     };
+    // Shared with the listener: the supervisor clears it before each
+    // attempt and `on_connection_failed` raises it.
+    let connect_failed = Arc::new(AtomicBool::new(false));
     let listener: Arc<dyn SmppClientListener + Send + Sync> = Arc::new(BindListener {
         state: state.clone(),
         bind_name: cfg.name.clone(),
         max_msg_per_sec: cfg.max_msg_per_sec,
+        connect_failed: connect_failed.clone(),
     });
 
     // session_init_timer in the smpp34 client is 5s; give the bind a
@@ -279,6 +319,8 @@ async fn run_bind_loop(state: Arc<State>, cfg: BindConfig) {
 
     let mut backoff_ms: u64 = 1_000;
     loop {
+        // Fresh attempt: any failure recorded belongs to this one.
+        connect_failed.store(false, Ordering::Relaxed);
         let mut client = SmppClient::new_with_default_timers(
             cfg.host.clone(),
             cfg.port,
@@ -303,9 +345,19 @@ async fn run_bind_loop(state: Arc<State>, cfg: BindConfig) {
             "establishing outbound bind");
         client.start().await;
 
-        // Phase 1: wait for bind to complete (or fail).
+        // Phase 1: wait for the bind to complete, the connect to fail, or
+        // the deadline to run out. Watching `connect_failed` matters
+        // because a refused connect starts no session at all, so
+        // `is_alive()` would stay false for the whole deadline and every
+        // reconnect attempt against a peer that is simply down would cost
+        // the full 15s before backing off.
         let bind_started = Instant::now();
-        while !client.is_alive() && bind_started.elapsed() < bind_deadline {
+        while awaiting_bind(
+            client.is_alive(),
+            connect_failed.load(Ordering::Relaxed),
+            bind_started.elapsed(),
+            bind_deadline,
+        ) {
             tokio::time::sleep(poll_interval).await;
         }
 
@@ -316,6 +368,10 @@ async fn run_bind_loop(state: Arc<State>, cfg: BindConfig) {
                 tokio::time::sleep(poll_interval).await;
             }
             Some(now)
+        } else if connect_failed.load(Ordering::Relaxed) {
+            // on_connection_failed already logged the cause at error level;
+            // don't restate it as a timeout it never was.
+            None
         } else {
             tracing::warn!(target: "siphon_smpp",
                 bind=%cfg.name, host=%cfg.host, port=cfg.port,
@@ -350,6 +406,20 @@ async fn run_bind_loop(state: Arc<State>, cfg: BindConfig) {
 
 #[async_trait]
 impl SmppServerListener for State {
+    /// The listening socket could not be bound (port in use, an address
+    /// this host does not own, a privileged port). Terminal — smpp34 never
+    /// starts an accept loop — so this is recorded for the server task to
+    /// act on rather than letting it park as though it were serving.
+    /// Before smpp34 1.4.0 this case panicked a tokio worker.
+    async fn on_listen_failed(&self, error: &str) {
+        tracing::error!(target: "siphon_smpp", error=%error,
+            "SMPP listening socket could not be bound");
+        if self.listen_failure.set(error.to_string()).is_err() {
+            tracing::warn!(target: "siphon_smpp", error=%error,
+                "second listen failure reported; keeping the first");
+        }
+    }
+
     async fn on_bind_transmitter(
         &self,
         request: bind_transmitter,
@@ -751,11 +821,31 @@ struct BindListener {
     state: Arc<State>,
     bind_name: String,
     max_msg_per_sec: u32,
+    /// Raised by [`SmppClientListener::on_connection_failed`] when an
+    /// attempt never reached a session. The supervisor clears it before
+    /// each attempt and watches it during the bind wait, so a refused
+    /// connect backs off immediately instead of sitting out the whole
+    /// bind deadline waiting for an `is_alive()` that can never flip.
+    connect_failed: Arc<AtomicBool>,
 }
 
 #[async_trait]
 impl SmppClientListener for BindListener {
     // on_unbind uses the trait default (accept).
+
+    /// The attempt never reached a session: TCP connect, TLS handshake or
+    /// socket setup failed, so no bind was sent and `is_alive()` can never
+    /// flip. Raise the flag the supervisor watches so it backs off now
+    /// instead of sitting out the full bind deadline, and log the real
+    /// cause — before smpp34 1.4.0 a refused connect panicked a tokio
+    /// worker and surfaced here only as a misleading bind timeout.
+    async fn on_connection_failed(&self, error: &str) {
+        tracing::error!(target: "siphon_smpp",
+            bind=%self.bind_name, error=%error,
+            "outbound bind could not connect");
+        metrics::record_bind_connect_failure(&self.bind_name);
+        self.connect_failed.store(true, Ordering::Relaxed);
+    }
 
     async fn on_deliver_sm(
         &self,
@@ -1209,6 +1299,63 @@ mod tests {
         let bare = a_data_sm().accept("abc".into()).encode();
         let through = with_resp_tlvs(a_data_sm().accept("abc".into()), Vec::new()).encode();
         assert_eq!(bare, through);
+    }
+
+    // ── Bind supervisor: phase-1 wait ───────────────────────────────
+
+    use std::time::Duration;
+
+    const DEADLINE: Duration = Duration::from_secs(15);
+
+    #[test]
+    fn awaiting_bind_waits_while_the_attempt_is_still_open() {
+        assert!(awaiting_bind(false, false, Duration::ZERO, DEADLINE));
+        assert!(awaiting_bind(
+            false,
+            false,
+            Duration::from_secs(14),
+            DEADLINE
+        ));
+    }
+
+    #[test]
+    fn awaiting_bind_stops_once_the_session_is_up() {
+        assert!(!awaiting_bind(true, false, Duration::ZERO, DEADLINE));
+    }
+
+    #[test]
+    fn awaiting_bind_stops_immediately_on_a_failed_connect() {
+        // The point of the smpp34 1.4.0 hook: a refused connect starts no
+        // session, so is_alive() can never flip. Without this term every
+        // retry against a downed peer burns the whole deadline first.
+        assert!(!awaiting_bind(false, true, Duration::ZERO, DEADLINE));
+        assert!(!awaiting_bind(
+            false,
+            true,
+            Duration::from_millis(1),
+            DEADLINE
+        ));
+    }
+
+    #[test]
+    fn awaiting_bind_stops_at_the_deadline() {
+        assert!(!awaiting_bind(false, false, DEADLINE, DEADLINE));
+        assert!(!awaiting_bind(
+            false,
+            false,
+            Duration::from_secs(16),
+            DEADLINE
+        ));
+    }
+
+    #[test]
+    fn awaiting_bind_never_outlives_a_live_session_or_a_failure() {
+        // Whatever the clock says, alive or failed both end the wait.
+        for waited in [Duration::ZERO, Duration::from_secs(3), DEADLINE] {
+            assert!(!awaiting_bind(true, false, waited, DEADLINE));
+            assert!(!awaiting_bind(false, true, waited, DEADLINE));
+            assert!(!awaiting_bind(true, true, waited, DEADLINE));
+        }
     }
 
     #[tokio::test]
