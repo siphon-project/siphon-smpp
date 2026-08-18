@@ -7,6 +7,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.5.1] — 2026-08-18
+
+### Fixed
+
+- **A bind could be torn down the instant it succeeded, via `smpp34` 1.4.1.**
+  Both sides read the bind handshake with a single `read()` and handed the whole
+  buffer to `CommandHeader::decode`, which rejects it when the buffer length and
+  `command_length` disagree. TCP has no message boundaries, so anything a peer
+  sends immediately behind its bind PDU can coalesce into the same segment and
+  take the session down before it carried a thing — every request on it then
+  failing at once rather than the odd one a correlation race would lose.
+
+  This is squarely our shape of traffic in both directions. An upstream SMSC with
+  queued MT sends its first `deliver_sm` the moment it accepts our bind, so it
+  catches up with its own `bind_transceiver_resp` and the outbound bind dies on
+  arrival (`PDU length 451 does not match command_length 31`, then `Unable to
+  decode bind response`) — the supervisor then reconnects into the same failure
+  for as long as the peer has traffic waiting. Symmetrically, an inbound ESME
+  that pipelines its first `submit_sm` without waiting for the bind response is
+  doing something legal, and we rejected the whole read. The handshake is now
+  framed like any other read, and bytes that arrived behind the bind PDU are
+  replayed into the session loop instead of being discarded. The bug predates
+  1.4.0 and every release of the crate before it.
+
+### Changed
+
+- **`smpp34` to 1.4.1.** No API change — the fix is entirely internal to the
+  handshake read path, so nothing on our side moved.
+
 ## [1.5.0] — 2026-08-18
 
 ### Fixed
