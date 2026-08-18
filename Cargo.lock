@@ -174,6 +174,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
 dependencies = [
  "axum-core",
+ "base64 0.22.1",
  "bytes",
  "form_urlencoded",
  "futures-util",
@@ -192,8 +193,10 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
+ "sha1",
  "sync_wrapper",
  "tokio",
+ "tokio-tungstenite",
  "tower",
  "tower-layer",
  "tower-service",
@@ -3094,9 +3097,9 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "siphon-rtp-proto"
-version = "0.1.4"
+version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "226aef8325e781c170039a9a580312c28aa52aa6dac5c5f797a0df9a513f1309"
+checksum = "26afa6b54b21e7ba5c89a57bda3743ce2d2b829955f454e2663ba4b983f4e134"
 dependencies = [
  "serde",
  "serde_bytes",
@@ -3107,7 +3110,7 @@ dependencies = [
 [[package]]
 name = "siphon-sip"
 version = "1.5.1"
-source = "git+https://github.com/siphon-project/siphon-sip?branch=main#56ca10add74c14c5234546586dfd5d1b5017d343"
+source = "git+https://github.com/siphon-project/siphon-sip?branch=main#98838668d0054c583afd41a20d9e4a11350de4cb"
 dependencies = [
  "aes",
  "arc-swap",
