@@ -904,9 +904,9 @@ dependencies = [
 
 [[package]]
 name = "smpp34"
-version = "1.4.0"
+version = "1.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "57d6e4e6ba7adc51114c527728f2a6b208f6d3a4de3a385a7802c312f4eec7d7"
+checksum = "954f5d0904730fc4ee59e340aa524b25add16920c37a30ba191e561f8db29a09"
 dependencies = [
  "async-trait",
  "bytes",
