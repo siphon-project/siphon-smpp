@@ -1,5 +1,7 @@
 # cargo-deny — dependency-graph security / license / source policy for siphon-smpp.
-# Local: `cargo deny check`  ·  CI: .github/workflows/audit.yml
+# Local: `cargo deny check`
+# CI: bans/licenses/sources gate every PR (ci.yaml `deny` job); advisories run
+#     weekly and report on an issue (audit.yml) rather than blocking a PR.
 # Docs: https://embarkstudios.github.io/cargo-deny/
 
 [graph]
@@ -19,8 +21,45 @@ ignore = [
 ]
 
 [bans]
-multiple-versions = "warn"
+# Duplicates are a hard failure, with the ones already in the graph skipped by
+# name. That way a *new* crate showing up twice fails the PR that introduced it,
+# while a dependabot bump of an already-duplicated crate does not go red and
+# force a deny.toml edit in the same PR. Skipping by name (not name@version) is
+# what buys that: the entry survives version churn.
+#
+# Every entry below arrives through siphon-sip's dependency tree, not ours.
+# Prune one when `cargo deny check bans` stops reporting it.
+multiple-versions = "deny"
 wildcards = "warn"
+skip = [
+    # RustCrypto's 0.10 → 0.11 trait generation. The two halves coexist because
+    # the p256/ecdsa/elliptic-curve stack still pins the older `digest` line
+    # while other consumers have moved on; it resolves when that stack bumps.
+    { crate = "block-buffer", reason = "RustCrypto 0.10/0.11 generation split" },
+    { crate = "const-oid", reason = "RustCrypto 0.10/0.11 generation split" },
+    { crate = "cpufeatures", reason = "RustCrypto 0.10/0.11 generation split" },
+    { crate = "crypto-common", reason = "RustCrypto 0.10/0.11 generation split" },
+    { crate = "der", reason = "RustCrypto 0.10/0.11 generation split" },
+    { crate = "digest", reason = "RustCrypto 0.10/0.11 generation split" },
+    { crate = "hmac", reason = "RustCrypto 0.10/0.11 generation split" },
+    { crate = "pem-rfc7468", reason = "RustCrypto 0.10/0.11 generation split" },
+    { crate = "sha2", reason = "RustCrypto 0.10/0.11 generation split" },
+    { crate = "spki", reason = "RustCrypto 0.10/0.11 generation split" },
+
+    # rand 0.9 → 0.10, dragging three getrandom / rand_core lines with it.
+    { crate = "getrandom", reason = "rand 0.9/0.10 transition" },
+    { crate = "rand", reason = "rand 0.9/0.10 transition" },
+    { crate = "rand_core", reason = "rand 0.9/0.10 transition" },
+
+    # Independent major bumps that have not finished propagating.
+    { crate = "base64", reason = "0.22 via reqwest/hyper-util/postgres, 0.23 direct" },
+    { crate = "hashbrown", reason = "0.14 transitive, 0.17 current" },
+    { crate = "nom", reason = "7.x transitive, 8.x current" },
+    { crate = "syn", reason = "2.x proc-macro deps, 3.x current" },
+    { crate = "thiserror", reason = "1.x transitive, 2.x current" },
+    { crate = "thiserror-impl", reason = "1.x transitive, 2.x current" },
+    { crate = "tower-http", reason = "0.6 via reqwest, 0.7 direct" },
+]
 # siphon-smpp embeds CPython via PyO3 (links libpython); that C dependency is
 # intentional, so there is no C-FFI ban list here.
 
