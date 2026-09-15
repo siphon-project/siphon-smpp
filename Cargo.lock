@@ -174,6 +174,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "31b698c5f9a010f6573133b09e0de5408834d0c82f8d7475a89fc1867a71cd90"
 dependencies = [
  "axum-core",
+ "base64 0.22.1",
  "bytes",
  "form_urlencoded",
  "futures-util",
@@ -192,8 +193,10 @@ dependencies = [
  "serde_json",
  "serde_path_to_error",
  "serde_urlencoded",
+ "sha1",
  "sync_wrapper",
  "tokio",
+ "tokio-tungstenite",
  "tower",
  "tower-layer",
  "tower-service",
@@ -1816,9 +1819,9 @@ checksum = "27b02d87554356db9e9a873add8782d4ea6e3e58ea071a9adb9a2e8ddb884a8b"
 
 [[package]]
 name = "netlink-sys"
-version = "0.8.8"
+version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cd6c30ed10fa69cc491d491b85cc971f6bdeb8e7367b7cde2ee6cc878d583fae"
+checksum = "c99d38e00b420df49e940fe0826e667c3dad82ac68eb4c2bbf754c1c14a83a10"
 dependencies = [
  "bytes",
  "libc",
@@ -2388,9 +2391,9 @@ dependencies = [
 
 [[package]]
 name = "quick-xml"
-version = "0.41.0"
+version = "0.42.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e660451e55124f798a69a5af3f49ccfbefbd41910eefd25caf2393e1f3473ec1"
+checksum = "41b1177fdf999d2321d3fb46ff47159d9c1fb9ad66a4879f8c50a0b504615e9b"
 dependencies = [
  "memchr",
  "serde",
@@ -3094,9 +3097,9 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "siphon-rtp-proto"
-version = "0.1.4"
+version = "0.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "226aef8325e781c170039a9a580312c28aa52aa6dac5c5f797a0df9a513f1309"
+checksum = "e86c05d7124484f19d7f4a2e23d37ad279f98805b855b1a52342ac275593637f"
 dependencies = [
  "serde",
  "serde_bytes",
@@ -3106,8 +3109,8 @@ dependencies = [
 
 [[package]]
 name = "siphon-sip"
-version = "1.5.1"
-source = "git+https://github.com/siphon-project/siphon-sip?branch=main#56ca10add74c14c5234546586dfd5d1b5017d343"
+version = "1.8.7"
+source = "git+https://github.com/siphon-project/siphon-sip?branch=main#ae58f8859b90c1aed61cc0d9227e12fd79df5279"
 dependencies = [
  "aes",
  "arc-swap",
@@ -3122,6 +3125,9 @@ dependencies = [
  "getrandom 0.4.3",
  "hickory-resolver",
  "http",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "indexmap",
  "ipnet",
  "libc",
@@ -3147,6 +3153,7 @@ dependencies = [
  "sha2 0.11.0",
  "siphon-rtp-proto",
  "socket2",
+ "tempfile",
  "thiserror 2.0.20",
  "tikv-jemalloc-ctl",
  "tikv-jemallocator",
@@ -3159,6 +3166,7 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+ "uppsala",
  "uuid",
  "webpki-roots",
  "x509-cert",
@@ -3889,6 +3897,12 @@ name = "untrusted"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
+
+[[package]]
+name = "uppsala"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a27f7d40a93824eefcf6b62fd2fa86bca9ea6a5825de56b4aa9a5ed7804b766c"
 
 [[package]]
 name = "url"
