@@ -7,6 +7,101 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [1.6.0] — Unreleased
+
+**Read this before upgrading.** A send that used to be reported as accepted can
+now be reported as rejected, because it was rejected all along. Scripts that
+check the result start seeing rejections; scripts that do not check it need to.
+
+### Fixed
+
+- **Every response that arrived was reported to the script as `ESME_ROK`.** The
+  send helpers (`submit_via`, `submit_multi_via`, `data_via`, `cancel_via`,
+  `query_via`, `replace_via`, `deliver_to`, `data_to`) built their result as a
+  success for any response PDU that decoded, without looking at the
+  `command_status` in its header. A peer answering `ESME_RTHROTTLED`,
+  `ESME_RMSGQFUL`, `ESME_RINVDSTADR`, `ESME_RSUBMITFAIL`, or an ESME answering
+  `ESME_RX_T_APPN` to a `deliver_sm`, was handed to the script as
+  `command_status == "ESME_ROK"`, `ok == True`. A rejected message therefore
+  looked delivered: not retried, not re-routed, not held. `resp.ok` has been
+  on the result since 1.0.0, and the script API reference says to check it and
+  `resp.command_status` for a peer's rejection; neither has ever been able to
+  show one.
+
+  The result now carries the status the peer sent, by name and as
+  `command_status_code`. `ok` is true only for `ESME_ROK`, and the object is
+  **falsy** otherwise, so `if resp:` means what it reads as. `message_id` is
+  empty on a rejection (a `submit_sm_resp` with a non-zero status has no body,
+  §4.4.2). A status outside SMPP 3.4 Table 5-2 — reserved, or in the vendor
+  range — reads as its hex value (`"0x00000401"`) rather than borrowing a name.
+
+  What an unmodified script sees change: `resp.ok`, `resp.command_status` and
+  `bool(resp)` are no longer constant. Nothing was removed or retyped.
+
+- **A handler's reject status could be answered `ESME_ROK`.** For an inbound
+  `submit_sm` (and a `data_sm` from an ESME) the runtime chose between accept
+  and reject by whether the reply had a `message_id`, not by its
+  `command_status`. `pdu.reply(command_status="ESME_RTHROTTLED",
+  message_id=our_id)` — natural for a handler that allocates its id first — went
+  out as an acceptance carrying that id. The reply's status now decides, on
+  every path.
+
+- **The default `submit_sm` acknowledgement was a malformed PDU.** `pdu.reply()`
+  with no `message_id`, a handler returning `None`, and the no-handler default
+  all produced an `ESME_ROK` `submit_sm_resp` that was a bare 16-octet header.
+  `message_id` is mandatory there (§4.4.2): an independent dissector flags the
+  PDU as malformed, and this crate's own codec refuses to decode it
+  (`ESME_RINVPARLEN`), so an ESME built on it never saw the acknowledgement. It
+  now carries an empty `message_id`.
+
+- **Seven statuses could not be named in a reply.** `pdu.reply(command_status=…)`
+  and `bind.reject(…)` rejected `ESME_RINVOPTPARSTREAM`, `ESME_ROPTPARNOTALLWD`,
+  `ESME_RINVPARLEN`, `ESME_RMISSINGOPTPARAM`, `ESME_RINVOPTPARAMVAL`,
+  `ESME_RDELIVERYFAILURE` and `ESME_RUNKNOWNERR` as unknown. All of Table 5-2 is
+  accepted now.
+
+### Added
+
+- **`smpp.SmppSendError`**, raised by a send helper that got no response PDU.
+  It subclasses `RuntimeError`, which is what these cases raised before, so an
+  existing `except RuntimeError` / `except Exception` still catches it. Its
+  `reason` separates what used to be one message string:
+  `"timeout"` (no response within `response_timer_ms`), `"closed"` (the session
+  ended while the request was outstanding), `"nack"` (the peer answered
+  `generic_nack`; `command_status` / `command_status_code` carry its status) and
+  `"unanswered"` (the session reported a failure with no response while still
+  up). After `"timeout"` or `"closed"` it is not known whether the peer took the
+  message. A bind or session that is not bound still raises `KeyError` before
+  anything is sent.
+- **`resp.command_status_code`** (the status as an integer) and
+  **`resp.throttled`** (true for `ESME_RTHROTTLED` and `ESME_RMSGQFUL`) on
+  `SmppResp` and `QueryResp`. `QueryResp` gained the same truthiness.
+- **`pdu.validity_period`, `pdu.schedule_delivery_time`,
+  `pdu.replace_if_present_flag`, `pdu.sm_default_msg_id`** on the inbound `Pdu`.
+  They are mandatory fields of `submit_sm`, `submit_sm_multi` and `replace_sm`
+  that the codec decoded and the script could not read, so a submitted validity
+  period was invisible. (`deliver_sm` has them in its layout but the
+  specification requires them NULL there.)
+
+### Changed
+
+- **`examples/gateway.py` and the cookbook check what they send.** Both treated
+  any returned response as success — the same mistake the runtime made on their
+  behalf.
+- The egress `max_msg_per_sec` limiter is unchanged: it paces what is sent and
+  takes no account of what the peer answers. A throttled response is surfaced to
+  the script, which decides whether to back off further.
+
+### Known limits
+
+- `"timeout"`, `"closed"` and `"unanswered"` are told apart from the elapsed
+  time and the session registry, because the codec reports all three with the
+  same error. A `generic_nack` carrying `ESME_RSYSERR` is reported as
+  `"unanswered"`, and one carrying a status outside Table 5-2 as
+  `ESME_RUNKNOWNERR`, for the same reason.
+- `data_sm_resp` carries an SMSC `message_id` (§4.7.2) that the codec does not
+  expose, so `data_via` still returns an empty `message_id` on success.
+
 ## [1.5.1] — 2026-08-18
 
 ### Fixed
