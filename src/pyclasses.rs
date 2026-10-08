@@ -55,10 +55,33 @@ pub struct Pdu {
     pub protocol_id: u8,
     #[pyo3(get)]
     pub priority_flag: u8,
+    /// When the message should first be delivered, in the SMPP time
+    /// format of §7.1.1 (absolute `YYMMDDhhmmsstnnp` or relative, ending
+    /// `R`); empty for immediate delivery. Carried by `submit_sm`,
+    /// `submit_sm_multi`, `replace_sm` and `deliver_sm` — where §4.6.1
+    /// says it must be NULL, so expect it empty there; empty elsewhere.
+    #[pyo3(get)]
+    pub schedule_delivery_time: String,
+    /// How long the message stays valid, in the same §7.1.1 format;
+    /// empty for the SMSC default. Same commands as
+    /// `schedule_delivery_time`.
+    #[pyo3(get)]
+    pub validity_period: String,
     #[pyo3(get)]
     pub registered_delivery: u8,
+    /// `replace_if_present_flag` (§5.2.18): 1 asks the SMSC to replace a
+    /// pending message with the same source, destination and
+    /// service_type. `submit_sm` / `submit_sm_multi`; unused (0) in a
+    /// conforming `deliver_sm`.
+    #[pyo3(get)]
+    pub replace_if_present_flag: u8,
     #[pyo3(get)]
     pub data_coding: u8,
+    /// `sm_default_msg_id` (§5.2.20): index of a canned message on the
+    /// SMSC, 0 when unused. `submit_sm` / `submit_sm_multi` /
+    /// `replace_sm`; unused (0) in a conforming `deliver_sm`.
+    #[pyo3(get)]
+    pub sm_default_msg_id: u8,
     #[pyo3(get)]
     pub sm_length: u8,
     /// Destination addresses for `submit_sm_multi` (SME addresses and/or
@@ -343,6 +366,10 @@ impl Pdu {
             esm_class: s.esm_class,
             protocol_id: s.protocol_id,
             priority_flag: s.priority_flag,
+            schedule_delivery_time: s.schedule_delivery_time.clone(),
+            validity_period: s.validity_period.clone(),
+            replace_if_present_flag: s.replace_if_present_flag,
+            sm_default_msg_id: s.sm_default_msg_id,
             registered_delivery: s.registered_delivery,
             data_coding: s.data_coding,
             sm_length: s.sm_length,
@@ -366,6 +393,10 @@ impl Pdu {
             esm_class: d.esm_class,
             protocol_id: d.protocol_id,
             priority_flag: d.priority_flag,
+            schedule_delivery_time: d.schedule_delivery_time.clone(),
+            validity_period: d.validity_period.clone(),
+            replace_if_present_flag: d.replace_if_present_flag,
+            sm_default_msg_id: d.sm_default_msg_id,
             registered_delivery: d.registered_delivery,
             data_coding: d.data_coding,
             sm_length: d.sm_length,
@@ -393,6 +424,10 @@ impl Pdu {
             esm_class: d.esm_class,
             protocol_id: 0,
             priority_flag: 0,
+            schedule_delivery_time: String::new(),
+            validity_period: String::new(),
+            replace_if_present_flag: 0,
+            sm_default_msg_id: 0,
             registered_delivery: d.registered_delivery,
             data_coding: d.data_coding,
             sm_length: 0,
@@ -418,6 +453,10 @@ impl Pdu {
             esm_class: 0,
             protocol_id: 0,
             priority_flag: 0,
+            schedule_delivery_time: String::new(),
+            validity_period: String::new(),
+            replace_if_present_flag: 0,
+            sm_default_msg_id: 0,
             registered_delivery: 0,
             data_coding: 0,
             sm_length: 0,
@@ -444,6 +483,10 @@ impl Pdu {
             esm_class: 0,
             protocol_id: 0,
             priority_flag: 0,
+            schedule_delivery_time: String::new(),
+            validity_period: String::new(),
+            replace_if_present_flag: 0,
+            sm_default_msg_id: 0,
             registered_delivery: 0,
             data_coding: 0,
             sm_length: 0,
@@ -455,8 +498,8 @@ impl Pdu {
 
     /// Build a `Pdu` from an inbound `replace_sm` — `message_id` + source
     /// address identify the message to replace; `short_message` is the new
-    /// body. (`schedule_delivery_time` / `validity_period` are carried on
-    /// the wire but not surfaced on `Pdu`.)
+    /// body, and `schedule_delivery_time` / `validity_period` /
+    /// `sm_default_msg_id` its new scheduling (§4.10.1).
     pub fn from_replace(r: &replace_sm) -> Self {
         Self {
             command: "replace_sm".into(),
@@ -471,6 +514,10 @@ impl Pdu {
             esm_class: 0,
             protocol_id: 0,
             priority_flag: 0,
+            schedule_delivery_time: r.schedule_delivery_time.clone(),
+            validity_period: r.validity_period.clone(),
+            replace_if_present_flag: 0,
+            sm_default_msg_id: r.sm_default_msg_id,
             registered_delivery: r.registered_delivery,
             data_coding: 0,
             sm_length: r.sm_length,
@@ -507,6 +554,10 @@ impl Pdu {
             esm_class: m.esm_class,
             protocol_id: m.protocol_id,
             priority_flag: m.priority_flag,
+            schedule_delivery_time: m.schedule_delivery_time.clone(),
+            validity_period: m.validity_period.clone(),
+            replace_if_present_flag: m.replace_if_present_flag,
+            sm_default_msg_id: m.sm_default_msg_id,
             registered_delivery: m.registered_delivery,
             data_coding: m.data_coding,
             sm_length: m.sm_length,
@@ -964,6 +1015,10 @@ mod tests {
             esm_class,
             protocol_id: 0,
             priority_flag: 0,
+            schedule_delivery_time: String::new(),
+            validity_period: String::new(),
+            replace_if_present_flag: 0,
+            sm_default_msg_id: 0,
             registered_delivery: 0,
             data_coding: 0,
             sm_length: 0,
@@ -1136,6 +1191,174 @@ mod tests {
         // SME addresses + the distribution-list name, all as strings.
         assert_eq!(pdu.destinations, vec!["15550101", "15550102", "vip"]);
         assert_eq!(pdu.short_message, b"hi");
+    }
+
+    // ── Scheduling / validity fields (§4.4.1, §4.6.1, §4.5.1, §4.10.1) ──
+
+    /// Read one attribute off a `Pdu` the way a script does.
+    fn script_reads<T: for<'a, 'py> pyo3::FromPyObject<'a, 'py>>(pdu: &Pdu, name: &str) -> T {
+        Python::attach(|py| {
+            let object = Py::new(py, pdu.clone()).expect("to python").into_any();
+            let value = object
+                .bind(py)
+                .getattr(name)
+                .unwrap_or_else(|e| panic!("pdu.{name}: {e}"));
+            value
+                .extract::<T>()
+                .unwrap_or_else(|_| panic!("pdu.{name} has an unexpected type"))
+        })
+    }
+
+    /// A `submit_sm` (or, with `command_id` 5, a `deliver_sm` — the two
+    /// bodies are laid out identically) written out field by field from
+    /// §4.4.1, with every scheduling field set to something non-default.
+    fn submit_or_deliver_wire(command_id: u32) -> Vec<u8> {
+        let mut body = Vec::new();
+        body.extend_from_slice(b"WAP\0"); // service_type
+        body.push(0x01); // source_addr_ton
+        body.push(0x01); // source_addr_npi
+        body.extend_from_slice(b"5550100\0"); // source_addr
+        body.push(0x01); // dest_addr_ton
+        body.push(0x01); // dest_addr_npi
+        body.extend_from_slice(b"5550199\0"); // destination_addr
+        body.push(0x00); // esm_class
+        body.push(0x00); // protocol_id
+        body.push(0x02); // priority_flag
+        body.extend_from_slice(b"260101120000000+\0"); // schedule_delivery_time (absolute, §7.1.1.1)
+        body.extend_from_slice(b"000000010000000R\0"); // validity_period (relative: 1 hour, §7.1.1.2)
+        body.push(0x01); // registered_delivery
+        body.push(0x01); // replace_if_present_flag
+        body.push(0x00); // data_coding
+        body.push(0x07); // sm_default_msg_id
+        body.push(0x02); // sm_length
+        body.extend_from_slice(b"hi"); // short_message
+
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&((16 + body.len()) as u32).to_be_bytes());
+        wire.extend_from_slice(&command_id.to_be_bytes());
+        wire.extend_from_slice(&0u32.to_be_bytes());
+        wire.extend_from_slice(&9u32.to_be_bytes());
+        wire.extend_from_slice(&body);
+        wire
+    }
+
+    fn assert_scheduling_fields(pdu: &Pdu) {
+        assert_eq!(script_reads::<String>(pdu, "service_type"), "WAP");
+        assert_eq!(script_reads::<u8>(pdu, "priority_flag"), 2);
+        assert_eq!(
+            script_reads::<String>(pdu, "schedule_delivery_time"),
+            "260101120000000+"
+        );
+        assert_eq!(
+            script_reads::<String>(pdu, "validity_period"),
+            "000000010000000R"
+        );
+        assert_eq!(script_reads::<u8>(pdu, "replace_if_present_flag"), 1);
+        assert_eq!(script_reads::<u8>(pdu, "sm_default_msg_id"), 7);
+    }
+
+    #[test]
+    fn a_submit_sm_exposes_its_validity_and_scheduling_fields() {
+        let wire = submit_or_deliver_wire(0x0000_0004);
+        let header = smpp34::CommandHeader::decode(&wire).expect("header");
+        let decoded = submit_sm::decode(header, &wire).expect("submit_sm");
+        assert_scheduling_fields(&Pdu::from_submit(&decoded));
+    }
+
+    #[test]
+    fn a_deliver_sm_exposes_whatever_its_scheduling_fields_carried() {
+        // §4.6.1 says these must be NULL in a deliver_sm. They are still
+        // on the wire, and a peer that fills them in should be visible
+        // as such rather than silently read as conforming.
+        let wire = submit_or_deliver_wire(0x0000_0005);
+        let header = smpp34::CommandHeader::decode(&wire).expect("header");
+        let decoded = deliver_sm::decode(header, &wire).expect("deliver_sm");
+        assert_scheduling_fields(&Pdu::from_deliver(&decoded));
+    }
+
+    #[test]
+    fn a_submit_multi_exposes_its_validity_and_scheduling_fields() {
+        // §4.5.1: as submit_sm, with the destination replaced by a list.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"WAP\0"); // service_type
+        body.push(0x01); // source_addr_ton
+        body.push(0x01); // source_addr_npi
+        body.extend_from_slice(b"5550100\0"); // source_addr
+        body.push(0x01); // number_of_dests
+        body.push(0x01); // dest_flag: SME address
+        body.push(0x01); // dest_addr_ton
+        body.push(0x01); // dest_addr_npi
+        body.extend_from_slice(b"5550199\0"); // destination_addr
+        body.push(0x00); // esm_class
+        body.push(0x00); // protocol_id
+        body.push(0x02); // priority_flag
+        body.extend_from_slice(b"260101120000000+\0"); // schedule_delivery_time
+        body.extend_from_slice(b"000000010000000R\0"); // validity_period
+        body.push(0x01); // registered_delivery
+        body.push(0x01); // replace_if_present_flag
+        body.push(0x00); // data_coding
+        body.push(0x07); // sm_default_msg_id
+        body.push(0x02); // sm_length
+        body.extend_from_slice(b"hi"); // short_message
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&((16 + body.len()) as u32).to_be_bytes());
+        wire.extend_from_slice(&0x0000_0021u32.to_be_bytes());
+        wire.extend_from_slice(&0u32.to_be_bytes());
+        wire.extend_from_slice(&9u32.to_be_bytes());
+        wire.extend_from_slice(&body);
+
+        let header = smpp34::CommandHeader::decode(&wire).expect("header");
+        let decoded = submit_sm_multi::decode(header, &wire).expect("submit_multi");
+        assert_scheduling_fields(&Pdu::from_submit_multi(&decoded));
+    }
+
+    #[test]
+    fn a_replace_sm_exposes_the_new_validity_and_schedule() {
+        // §4.10.1 body.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"id-1\0"); // message_id
+        body.push(0x01); // source_addr_ton
+        body.push(0x01); // source_addr_npi
+        body.extend_from_slice(b"5550100\0"); // source_addr
+        body.extend_from_slice(b"260101120000000+\0"); // schedule_delivery_time
+        body.extend_from_slice(b"000000010000000R\0"); // validity_period
+        body.push(0x01); // registered_delivery
+        body.push(0x07); // sm_default_msg_id
+        body.push(0x02); // sm_length
+        body.extend_from_slice(b"hi"); // short_message
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&((16 + body.len()) as u32).to_be_bytes());
+        wire.extend_from_slice(&0x0000_0007u32.to_be_bytes());
+        wire.extend_from_slice(&0u32.to_be_bytes());
+        wire.extend_from_slice(&9u32.to_be_bytes());
+        wire.extend_from_slice(&body);
+
+        let header = smpp34::CommandHeader::decode(&wire).expect("header");
+        let decoded = replace_sm::decode(header, &wire).expect("replace_sm");
+        let pdu = Pdu::from_replace(&decoded);
+        assert_eq!(
+            script_reads::<String>(&pdu, "schedule_delivery_time"),
+            "260101120000000+"
+        );
+        assert_eq!(
+            script_reads::<String>(&pdu, "validity_period"),
+            "000000010000000R"
+        );
+        assert_eq!(script_reads::<u8>(&pdu, "sm_default_msg_id"), 7);
+        // replace_sm has no replace_if_present_flag.
+        assert_eq!(script_reads::<u8>(&pdu, "replace_if_present_flag"), 0);
+    }
+
+    #[test]
+    fn commands_without_scheduling_fields_read_as_unset() {
+        Python::attach(|_py| {
+            let q = query_sm::new(1, "id-1".into(), 1, 1, "5550100".into());
+            let pdu = Pdu::from_query(&q);
+            assert_eq!(script_reads::<String>(&pdu, "validity_period"), "");
+            assert_eq!(script_reads::<String>(&pdu, "schedule_delivery_time"), "");
+            assert_eq!(script_reads::<u8>(&pdu, "replace_if_present_flag"), 0);
+            assert_eq!(script_reads::<u8>(&pdu, "sm_default_msg_id"), 0);
+        });
     }
 
     #[test]
