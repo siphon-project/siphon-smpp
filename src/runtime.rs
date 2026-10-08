@@ -63,6 +63,10 @@ pub(crate) struct State {
     /// What to do when an inbound submit exceeds `inbound_max_mps`:
     /// pace (delay the resp) or reject with `ESME_RTHROTTLED`.
     pub inbound_throttle_action: ThrottleAction,
+    /// `server.response_timer_ms`: how long a request we send to a bound
+    /// ESME waits for its response. Copied onto each [`EsmeSession`] so
+    /// the send helpers can tell a timeout from a session that closed.
+    pub inbound_response_timer: std::time::Duration,
     /// Set by [`SmppServerListener::on_listen_failed`] when the listening
     /// socket could not be bound. Terminal: no connection is ever accepted
     /// after it, so the server task reports it and stops instead of parking
@@ -80,6 +84,9 @@ pub(crate) struct BindSession {
     /// Per-bind outbound rate limiter (`max_msg_per_sec`); `None` when
     /// unlimited.
     pub throttle: Option<Arc<RateLimiter>>,
+    /// The bind's `response_timer_ms` — the same value the session was
+    /// started with, kept here because `SMSC` does not expose it.
+    pub response_timer: std::time::Duration,
 }
 
 /// A bound inbound ESME session (an ESME that connected to *us*).
@@ -92,6 +99,31 @@ pub(crate) struct EsmeSession {
     /// `submit_sm_multi` (paced or rejected per `server.throttle_action`)
     /// — the ingress mirror of `BindSession::throttle`.
     pub throttle: Option<Arc<RateLimiter>>,
+    /// `server.response_timer_ms`, as the session was started with.
+    pub response_timer: std::time::Duration,
+}
+
+/// True when `smsc` is no longer a registered outbound session — it was
+/// removed by [`SmppClientListener::on_smsc_unbound`]. smpp34 awaits that
+/// hook before it releases the requests still outstanding on the session,
+/// so a send helper that sees its request fail can ask here whether the
+/// session ending is why.
+pub(crate) async fn bind_gone(binds: &Mutex<Vec<BindSession>>, smsc: &Arc<SMSC>) -> bool {
+    !binds
+        .lock()
+        .await
+        .iter()
+        .any(|b| Arc::ptr_eq(&b.smsc, smsc))
+}
+
+/// The inbound mirror of [`bind_gone`]: true once
+/// [`SmppServerListener::on_esme_unbound`] has dropped `esme`.
+pub(crate) async fn esme_gone(esmes: &Mutex<Vec<EsmeSession>>, esme: &Arc<ESME>) -> bool {
+    !esmes
+        .lock()
+        .await
+        .iter()
+        .any(|e| Arc::ptr_eq(&e.esme, esme))
 }
 
 pub(crate) static STATE: OnceLock<Arc<State>> = OnceLock::new();
@@ -189,6 +221,7 @@ pub fn spawn(cfg: SmppConfig, script: ScriptHandle) {
         esmes: Mutex::new(Vec::new()),
         inbound_max_mps: cfg.server.max_msg_per_sec,
         inbound_throttle_action: cfg.server.throttle_action,
+        inbound_response_timer: std::time::Duration::from_millis(cfg.server.response_timer_ms),
         listen_failure: OnceLock::new(),
         script: script.clone(),
     });
@@ -302,6 +335,7 @@ async fn run_bind_loop(state: Arc<State>, cfg: BindConfig) {
         state: state.clone(),
         bind_name: cfg.name.clone(),
         max_msg_per_sec: cfg.max_msg_per_sec,
+        response_timer: std::time::Duration::from_millis(cfg.response_timer_ms),
         connect_failed: connect_failed.clone(),
     });
 
@@ -717,6 +751,7 @@ impl SmppServerListener for State {
         self.esmes.lock().await.push(EsmeSession {
             esme: Arc::new(esme),
             throttle,
+            response_timer: self.inbound_response_timer,
         });
         dispatch_session(&self.script, "bound", session).await;
     }
@@ -821,6 +856,8 @@ struct BindListener {
     state: Arc<State>,
     bind_name: String,
     max_msg_per_sec: u32,
+    /// The bind's `response_timer_ms`, recorded on each session it brings up.
+    response_timer: std::time::Duration,
     /// Raised by [`SmppClientListener::on_connection_failed`] when an
     /// attempt never reached a session. The supervisor clears it before
     /// each attempt and watches it during the bind wait, so a refused
@@ -962,6 +999,7 @@ impl SmppClientListener for BindListener {
             name: self.bind_name.clone(),
             smsc: Arc::new(smsc),
             throttle,
+            response_timer: self.response_timer,
         });
         dispatch_session(&self.state.script, "bound", session).await;
     }

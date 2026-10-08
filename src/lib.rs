@@ -52,9 +52,12 @@
 pub mod config;
 pub mod install;
 pub(crate) mod metrics;
+pub(crate) mod outcome;
 pub mod pyclasses;
 pub mod runtime;
 pub mod sends;
+#[cfg(test)]
+mod session_tests;
 pub mod tlv;
 
 pub use config::SmppConfig;

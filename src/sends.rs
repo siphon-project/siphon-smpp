@@ -11,7 +11,9 @@
 //! Each resolves the session out of [`crate::runtime::state`] (set when
 //! the SMPP task starts), clones the handle, **drops the lock before
 //! awaiting** so one slow peer can't block another, then awaits the
-//! response and returns a typed [`SmppResp`].
+//! response and returns a typed [`SmppResp`] carrying the peer's own
+//! `command_status`. A request that gets no response PDU raises
+//! `SmppSendError` instead — see [`crate::outcome`].
 
 use pyo3::exceptions::{PyKeyError, PyRuntimeError, PyValueError};
 use pyo3::prelude::*;
@@ -19,12 +21,17 @@ use pyo3::types::PyDict;
 
 use smpp34::client::SMSC;
 use smpp34::server::ESME;
-use smpp34::{data_sm, submit_sm_multi, DestAddress, Tlv, TlvList, TlvTag};
+use smpp34::{
+    data_sm, query_sm_resp, submit_sm_multi, DestAddress, SmppError, Tlv, TlvList, TlvTag,
+};
 
 use crate::metrics;
+use crate::outcome::{is_throttle, settle, status_name, Reply};
 use crate::runtime::{self, RateLimiter, State};
 use crate::tlv::tlvs_from_py;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// `short_message` is one length octet plus at most 254 octets of body
 /// (§5.2.21). smpp34's PDU constructors `assert!` on that limit, so an
@@ -109,56 +116,96 @@ fn build_data_sm(
     .with_tlvs(tlvs))
 }
 
-/// Response returned by the send helpers.
+/// Response returned by the send helpers: what the peer answered.
 ///
-/// `command_status` is the SMPP status name ("ESME_ROK" on success).
-/// `message_id` is the SMSC-assigned id when the op returns one
-/// (`submit_sm` / `data_sm`); empty otherwise (`deliver_sm`,
-/// `cancel_sm`).
+/// `command_status` is the status name from the response header
+/// (`"ESME_ROK"`, `"ESME_RTHROTTLED"`, …; a value outside SMPP 3.4
+/// Table 5-2 reads as its hex literal, e.g. `"0x00000401"`) and
+/// `command_status_code` the same status as the integer that was on the
+/// wire. The object is truthy, and `ok` is true, only for `ESME_ROK`.
+///
+/// `message_id` is the SMSC-assigned id when the op returns one and
+/// succeeded (`submit_sm` / `submit_sm_multi`); empty otherwise — a
+/// `submit_sm_resp` with a non-zero status has no body (§4.4.2).
+///
+/// A request that got no response PDU at all does not produce one of
+/// these: the helper raises `SmppSendError`.
 #[pyclass(module = "siphon.smpp", name = "SmppResp", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct SmppResp {
     #[pyo3(get)]
     pub command_status: String,
     #[pyo3(get)]
+    pub command_status_code: u32,
+    #[pyo3(get)]
     pub message_id: String,
 }
 
 #[pymethods]
 impl SmppResp {
+    /// True only when the peer answered `ESME_ROK`.
     #[getter]
     fn ok(&self) -> bool {
-        self.command_status == "ESME_ROK"
+        self.command_status_code == SmppError::ESME_ROK as u32
+    }
+
+    /// True when the peer asked us to back off: `ESME_RTHROTTLED` or
+    /// `ESME_RMSGQFUL` (§5.1.3). The message was **not** accepted.
+    #[getter]
+    fn throttled(&self) -> bool {
+        is_throttle(self.command_status_code)
+    }
+
+    /// `if resp:` is `if resp.ok:` — a rejection is falsy.
+    fn __bool__(&self) -> bool {
+        self.ok()
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "SmppResp(command_status={:?}, message_id={:?})",
-            self.command_status, self.message_id
+            "SmppResp(command_status={:?}, command_status_code=0x{:08X}, message_id={:?})",
+            self.command_status, self.command_status_code, self.message_id
         )
     }
 }
 
 impl SmppResp {
-    fn ok_with(message_id: String) -> Self {
+    /// Report a response PDU as the peer sent it.
+    pub(crate) fn from_reply(reply: &impl Reply) -> Self {
+        let status = reply.status();
         Self {
-            command_status: "ESME_ROK".to_string(),
-            message_id,
+            command_status: status_name(status),
+            command_status_code: status,
+            message_id: reply.message_id(),
+        }
+    }
+
+    /// For `alert_notification`, which has no response PDU (§4.12): the
+    /// write is all there is to report.
+    fn written() -> Self {
+        Self {
+            command_status: status_name(SmppError::ESME_ROK as u32),
+            command_status_code: SmppError::ESME_ROK as u32,
+            message_id: String::new(),
         }
     }
 }
 
 /// Response returned by [`query_via`] — the result of a `query_sm`.
 ///
+/// `command_status` / `command_status_code` / `ok` / truthiness are as on
+/// [`SmppResp`]. The remaining fields are only meaningful when `ok`:
 /// `message_state` is the SMPP message-state code (1=ENROUTE, 2=DELIVERED,
 /// 3=EXPIRED, 4=DELETED, 5=UNDELIVERABLE, 6=ACCEPTED, 7=UNKNOWN,
-/// 8=REJECTED). `final_date` is the SMPP-format absolute time (empty if
-/// not final); `error_code` the network error code.
+/// 8=REJECTED), `final_date` the SMPP-format absolute time (empty if not
+/// final) and `error_code` the network error code.
 #[pyclass(module = "siphon.smpp", name = "QueryResp", skip_from_py_object)]
 #[derive(Debug, Clone)]
 pub struct QueryResp {
     #[pyo3(get)]
     pub command_status: String,
+    #[pyo3(get)]
+    pub command_status_code: u32,
     #[pyo3(get)]
     pub message_id: String,
     #[pyo3(get)]
@@ -171,45 +218,120 @@ pub struct QueryResp {
 
 #[pymethods]
 impl QueryResp {
+    /// True only when the peer answered `ESME_ROK`.
     #[getter]
     fn ok(&self) -> bool {
-        self.command_status == "ESME_ROK"
+        self.command_status_code == SmppError::ESME_ROK as u32
+    }
+
+    /// True for `ESME_RTHROTTLED` / `ESME_RMSGQFUL`.
+    #[getter]
+    fn throttled(&self) -> bool {
+        is_throttle(self.command_status_code)
+    }
+
+    fn __bool__(&self) -> bool {
+        self.ok()
     }
 
     fn __repr__(&self) -> String {
         format!(
-            "QueryResp(command_status={:?}, message_id={:?}, message_state={}, final_date={:?}, error_code={})",
-            self.command_status, self.message_id, self.message_state, self.final_date, self.error_code
+            "QueryResp(command_status={:?}, command_status_code=0x{:08X}, message_id={:?}, message_state={}, final_date={:?}, error_code={})",
+            self.command_status, self.command_status_code, self.message_id, self.message_state, self.final_date, self.error_code
         )
+    }
+}
+
+impl QueryResp {
+    /// Report a `query_sm_resp` as the peer sent it.
+    pub(crate) fn from_reply(reply: &query_sm_resp) -> Self {
+        let status = reply.status();
+        Self {
+            command_status: status_name(status),
+            command_status_code: status,
+            message_id: reply.message_id.clone(),
+            message_state: reply.message_state,
+            final_date: reply.final_date.clone(),
+            error_code: reply.error_code,
+        }
     }
 }
 
 // ── Lookups (clone the handle out, then drop the guard) ─────────────────
 
-/// Resolve an outbound bind by name → its `SMSC` handle + optional
-/// rate limiter. Returns a `PyKeyError` if the bind isn't currently
-/// bound (it may be mid-reconnect).
-async fn bind_handle(
-    state: &Arc<State>,
-    bind: &str,
-) -> PyResult<(Arc<SMSC>, Option<Arc<RateLimiter>>)> {
+/// What a send helper needs from a bound outbound session.
+struct BindTarget {
+    smsc: Arc<SMSC>,
+    throttle: Option<Arc<RateLimiter>>,
+    response_timer: Duration,
+}
+
+/// Resolve an outbound bind by name. Returns a `PyKeyError` if the bind
+/// isn't currently bound (it may be mid-reconnect).
+async fn bind_handle(state: &Arc<State>, bind: &str) -> PyResult<BindTarget> {
     let binds = state.binds.lock().await;
     binds
         .iter()
         .find(|b| b.name == bind)
-        .map(|b| (b.smsc.clone(), b.throttle.clone()))
+        .map(|b| BindTarget {
+            smsc: b.smsc.clone(),
+            throttle: b.throttle.clone(),
+            response_timer: b.response_timer,
+        })
         .ok_or_else(|| PyKeyError::new_err(format!("bind {bind:?} not bound")))
 }
 
-/// Resolve an inbound ESME session by `session_id`. Returns a
-/// `PyKeyError` if no such session is currently bound.
-async fn esme_handle(state: &Arc<State>, session_id: &str) -> PyResult<Arc<ESME>> {
+/// Resolve an inbound ESME session by `session_id` → its handle and
+/// response timer. Returns a `PyKeyError` if no such session is bound.
+async fn esme_handle(state: &Arc<State>, session_id: &str) -> PyResult<(Arc<ESME>, Duration)> {
     let esmes = state.esmes.lock().await;
     esmes
         .iter()
         .find(|e| e.esme.session_id == session_id)
-        .map(|e| e.esme.clone())
+        .map(|e| (e.esme.clone(), e.response_timer))
         .ok_or_else(|| PyKeyError::new_err(format!("esme session {session_id:?} not bound")))
+}
+
+/// Pace a request against the bind's `max_msg_per_sec`, if it has one.
+/// This limits what we send; it knows nothing of what the peer answers.
+async fn pace(throttle: Option<Arc<RateLimiter>>) {
+    if let Some(limiter) = throttle {
+        // A pacing wait is an egress throttle event.
+        if limiter.acquire().await {
+            metrics::record_throttled(metrics::EGRESS);
+        }
+    }
+}
+
+/// Await a request on an outbound bind and report the peer's answer.
+async fn settle_on_bind<R>(
+    state: &State,
+    target: &BindTarget,
+    bind: &str,
+    command: &str,
+    send: impl Future<Output = Result<R, SmppError>>,
+) -> PyResult<R> {
+    settle(
+        send,
+        target.response_timer,
+        runtime::bind_gone(&state.binds, &target.smsc),
+    )
+    .await
+    .map_err(|failure| failure.into_pyerr(command, &format!("bind {bind:?}")))
+}
+
+/// Await a request on an inbound ESME session and report its answer.
+async fn settle_on_esme<R>(
+    state: &State,
+    esme: &Arc<ESME>,
+    response_timer: Duration,
+    session_id: &str,
+    command: &str,
+    send: impl Future<Output = Result<R, SmppError>>,
+) -> PyResult<R> {
+    settle(send, response_timer, runtime::esme_gone(&state.esmes, esme))
+        .await
+        .map_err(|failure| failure.into_pyerr(command, &format!("session {session_id:?}")))
 }
 
 // ── Outbound: target a bind by name ─────────────────────────────────────
@@ -268,14 +390,10 @@ pub fn submit_via<'py>(
     check_short_message("submit_sm", short_message.len(), true)?;
     let tlvs = tlvs_from_py(tlvs)?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let (smsc, throttle) = bind_handle(&state, &bind).await?;
-        if let Some(limiter) = throttle {
-            // A pacing wait is an egress throttle event.
-            if limiter.acquire().await {
-                metrics::record_throttled(metrics::EGRESS);
-            }
-        }
-        let resp = smsc
+        let target = bind_handle(&state, &bind).await?;
+        pace(target.throttle.clone()).await;
+        let send = target
+            .smsc
             .submit_sm()
             .service_type(service_type)
             .source_addr_ton(source_addr_ton)
@@ -295,14 +413,9 @@ pub fn submit_via<'py>(
             .sm_default_msg_id(sm_default_msg_id)
             .short_message(short_message)
             .tlvs(tlvs)
-            .send()
-            .await;
-        match resp {
-            Ok(r) => Ok(SmppResp::ok_with(r.message_id.unwrap_or_default())),
-            Err(e) => Err(PyRuntimeError::new_err(format!(
-                "bind {bind:?} submit_sm failed: {e:?}"
-            ))),
-        }
+            .send();
+        let resp = settle_on_bind(&state, &target, &bind, "submit_sm", send).await?;
+        Ok(SmppResp::from_reply(&resp))
     })
 }
 
@@ -377,13 +490,8 @@ pub fn submit_multi_via<'py>(
         )));
     }
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let (smsc, throttle) = bind_handle(&state, &bind).await?;
-        if let Some(limiter) = throttle {
-            // A pacing wait is an egress throttle event.
-            if limiter.acquire().await {
-                metrics::record_throttled(metrics::EGRESS);
-            }
-        }
+        let target = bind_handle(&state, &bind).await?;
+        pace(target.throttle.clone()).await;
         // Sequence number 0: send_submit_sm_multi_pdu owns the sequence
         // space and overwrites it.
         let pdu = submit_sm_multi::new(
@@ -405,13 +513,9 @@ pub fn submit_multi_via<'py>(
             short_message,
         )
         .with_tlvs(tlvs);
-        let resp = smsc.send_submit_sm_multi_pdu(pdu).await;
-        match resp {
-            Ok(r) => Ok(SmppResp::ok_with(r.message_id.unwrap_or_default())),
-            Err(e) => Err(PyRuntimeError::new_err(format!(
-                "bind {bind:?} submit_sm_multi failed: {e:?}"
-            ))),
-        }
+        let send = target.smsc.send_submit_sm_multi_pdu(pdu);
+        let resp = settle_on_bind(&state, &target, &bind, "submit_sm_multi", send).await?;
+        Ok(SmppResp::from_reply(&resp))
     })
 }
 
@@ -472,20 +576,11 @@ pub fn data_via<'py>(
         tlvs_from_py(tlvs)?,
     )?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let (smsc, throttle) = bind_handle(&state, &bind).await?;
-        if let Some(limiter) = throttle {
-            // A pacing wait is an egress throttle event.
-            if limiter.acquire().await {
-                metrics::record_throttled(metrics::EGRESS);
-            }
-        }
-        let resp = smsc.send_data_sm_pdu(pdu).await;
-        match resp {
-            Ok(_) => Ok(SmppResp::ok_with(String::new())),
-            Err(e) => Err(PyRuntimeError::new_err(format!(
-                "bind {bind:?} data_sm failed: {e:?}"
-            ))),
-        }
+        let target = bind_handle(&state, &bind).await?;
+        pace(target.throttle.clone()).await;
+        let send = target.smsc.send_data_sm_pdu(pdu);
+        let resp = settle_on_bind(&state, &target, &bind, "data_sm", send).await?;
+        Ok(SmppResp::from_reply(&resp))
     })
 }
 
@@ -522,25 +617,19 @@ pub fn cancel_via<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let state = require_state()?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let (smsc, _) = bind_handle(&state, &bind).await?;
-        let resp = smsc
-            .send_cancel_sm(
-                service_type,
-                message_id,
-                source_addr_ton,
-                source_addr_npi,
-                source_addr,
-                dest_addr_ton,
-                dest_addr_npi,
-                destination_addr,
-            )
-            .await;
-        match resp {
-            Ok(_) => Ok(SmppResp::ok_with(String::new())),
-            Err(e) => Err(PyRuntimeError::new_err(format!(
-                "bind {bind:?} cancel_sm failed: {e:?}"
-            ))),
-        }
+        let target = bind_handle(&state, &bind).await?;
+        let send = target.smsc.send_cancel_sm(
+            service_type,
+            message_id,
+            source_addr_ton,
+            source_addr_npi,
+            source_addr,
+            dest_addr_ton,
+            dest_addr_npi,
+            destination_addr,
+        );
+        let resp = settle_on_bind(&state, &target, &bind, "cancel_sm", send).await?;
+        Ok(SmppResp::from_reply(&resp))
     })
 }
 
@@ -562,22 +651,13 @@ pub fn query_via<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let state = require_state()?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let (smsc, _) = bind_handle(&state, &bind).await?;
-        let resp = smsc
-            .send_query_sm(message_id, source_addr_ton, source_addr_npi, source_addr)
-            .await;
-        match resp {
-            Ok(r) => Ok(QueryResp {
-                command_status: "ESME_ROK".to_string(),
-                message_id: r.message_id,
-                message_state: r.message_state,
-                final_date: r.final_date,
-                error_code: r.error_code,
-            }),
-            Err(e) => Err(PyRuntimeError::new_err(format!(
-                "bind {bind:?} query_sm failed: {e:?}"
-            ))),
-        }
+        let target = bind_handle(&state, &bind).await?;
+        let send =
+            target
+                .smsc
+                .send_query_sm(message_id, source_addr_ton, source_addr_npi, source_addr);
+        let resp = settle_on_bind(&state, &target, &bind, "query_sm", send).await?;
+        Ok(QueryResp::from_reply(&resp))
     })
 }
 
@@ -611,26 +691,20 @@ pub fn replace_via<'py>(
     // message_payload to fall back on — the body has to fit.
     check_short_message("replace_sm", short_message.len(), false)?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let (smsc, _) = bind_handle(&state, &bind).await?;
-        let resp = smsc
-            .send_replace_sm(
-                message_id,
-                source_addr_ton,
-                source_addr_npi,
-                source_addr,
-                schedule_delivery_time,
-                validity_period,
-                registered_delivery,
-                sm_default_msg_id,
-                short_message,
-            )
-            .await;
-        match resp {
-            Ok(_) => Ok(SmppResp::ok_with(String::new())),
-            Err(e) => Err(PyRuntimeError::new_err(format!(
-                "bind {bind:?} replace_sm failed: {e:?}"
-            ))),
-        }
+        let target = bind_handle(&state, &bind).await?;
+        let send = target.smsc.send_replace_sm(
+            message_id,
+            source_addr_ton,
+            source_addr_npi,
+            source_addr,
+            schedule_delivery_time,
+            validity_period,
+            registered_delivery,
+            sm_default_msg_id,
+            short_message,
+        );
+        let resp = settle_on_bind(&state, &target, &bind, "replace_sm", send).await?;
+        Ok(SmppResp::from_reply(&resp))
     })
 }
 
@@ -690,13 +764,13 @@ pub fn deliver_to<'py>(
     check_short_message("deliver_sm", short_message.len(), true)?;
     let tlvs = tlvs_from_py(tlvs)?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let esme = esme_handle(&state, &session_id).await?;
+        let (esme, response_timer) = esme_handle(&state, &session_id).await?;
         if !esme.can_receive {
             return Err(PyRuntimeError::new_err(format!(
                 "esme session {session_id:?} is not RX/TRX — cannot deliver_sm"
             )));
         }
-        let resp = esme
+        let send = esme
             .deliver_sm()
             .service_type(service_type)
             .source_addr_ton(source_addr_ton)
@@ -716,14 +790,17 @@ pub fn deliver_to<'py>(
             .sm_default_msg_id(sm_default_msg_id)
             .short_message(short_message)
             .tlvs(tlvs)
-            .send()
-            .await;
-        match resp {
-            Ok(_) => Ok(SmppResp::ok_with(String::new())),
-            Err(e) => Err(PyRuntimeError::new_err(format!(
-                "deliver_sm to session {session_id:?} failed: {e:?}"
-            ))),
-        }
+            .send();
+        let resp = settle_on_esme(
+            &state,
+            &esme,
+            response_timer,
+            &session_id,
+            "deliver_sm",
+            send,
+        )
+        .await?;
+        Ok(SmppResp::from_reply(&resp))
     })
 }
 
@@ -780,21 +857,18 @@ pub fn data_to<'py>(
         tlvs_from_py(tlvs)?,
     )?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let esme = esme_handle(&state, &session_id).await?;
-        let resp = esme.send_data_sm_pdu(pdu).await;
-        match resp {
-            Ok(_) => Ok(SmppResp::ok_with(String::new())),
-            Err(e) => Err(PyRuntimeError::new_err(format!(
-                "data_sm to session {session_id:?} failed: {e:?}"
-            ))),
-        }
+        let (esme, response_timer) = esme_handle(&state, &session_id).await?;
+        let send = esme.send_data_sm_pdu(pdu);
+        let resp =
+            settle_on_esme(&state, &esme, response_timer, &session_id, "data_sm", send).await?;
+        Ok(SmppResp::from_reply(&resp))
     })
 }
 
 /// Send an `alert_notification` to a bound ESME — tell it a previously
 /// unavailable MS is reachable again so it can flush queued MT.
 /// `alert_notification` is a notification (no response); resolves to an
-/// [`SmppResp`] (always `ESME_ROK`) once written.
+/// [`SmppResp`] (always `ESME_ROK`) once handed to the session writer.
 #[allow(clippy::too_many_arguments)]
 #[pyfunction]
 #[pyo3(signature = (
@@ -821,7 +895,7 @@ pub fn alert_to<'py>(
 ) -> PyResult<Bound<'py, PyAny>> {
     let state = require_state()?;
     pyo3_async_runtimes::tokio::future_into_py(py, async move {
-        let esme = esme_handle(&state, &session_id).await?;
+        let (esme, _) = esme_handle(&state, &session_id).await?;
         if !esme.can_receive {
             return Err(PyRuntimeError::new_err(format!(
                 "esme session {session_id:?} is not RX/TRX — cannot alert_notification"
@@ -837,7 +911,7 @@ pub fn alert_to<'py>(
             ms_availability_status,
         )
         .await;
-        Ok(SmppResp::ok_with(String::new()))
+        Ok(SmppResp::written())
     })
 }
 

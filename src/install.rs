@@ -18,6 +18,7 @@ use std::ffi::CString;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 
+use crate::outcome::SmppSendError;
 use crate::pyclasses::{AlertNotification, Bind, BindResult, Pdu, PduReply, Session};
 use crate::sends::{
     alert_to, cancel_via, data_to, data_via, deliver_to, query_via, replace_via, submit_multi_via,
@@ -60,6 +61,8 @@ pub fn namespace(
         module.add_class::<AlertNotification>()?;
         module.add_class::<SmppResp>()?;
         module.add_class::<QueryResp>()?;
+        // Raised by the send helpers when a request gets no response PDU.
+        module.add("SmppSendError", py.get_type::<SmppSendError>())?;
 
         // ── Send helpers ──────────────────────────────────────────
         // These need the runtime state (set by the task); each is
@@ -159,4 +162,37 @@ fn build_config_dict<'py>(py: Python<'py>, cfg: &SmppConfig) -> PyResult<Bound<'
     dict.set_item("routing", routing)?;
 
     Ok(dict)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pyo3::exceptions::PyRuntimeError;
+
+    #[test]
+    fn the_namespace_exposes_the_send_error_as_a_runtime_error() {
+        Python::attach(|py| {
+            let cfg: SmppConfig = serde_yaml::from_str("{}").expect("empty config");
+            let module = namespace(cfg)(py).expect("namespace builds");
+            let module = module.bind(py);
+            let error = module.getattr("SmppSendError").expect("smpp.SmppSendError");
+            // Scripts written against the old behaviour catch RuntimeError.
+            let runtime_error = py.get_type::<PyRuntimeError>();
+            let is_subclass: bool = py
+                .import("builtins")
+                .and_then(|builtins| builtins.getattr("issubclass"))
+                .and_then(|issubclass| issubclass.call1((&error, runtime_error)))
+                .and_then(|result| result.extract())
+                .expect("issubclass");
+            assert!(is_subclass);
+            let name: String = error
+                .getattr("__name__")
+                .and_then(|n| n.extract())
+                .expect("name");
+            assert_eq!(name, "SmppSendError");
+            // The result types it sits beside are still there.
+            assert!(module.getattr("SmppResp").is_ok());
+            assert!(module.getattr("QueryResp").is_ok());
+        });
+    }
 }
