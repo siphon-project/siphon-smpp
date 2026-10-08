@@ -147,8 +147,14 @@ async def on_submit(pdu, session):
             data_coding=pdu.data_coding,
             registered_delivery=pdu.registered_delivery,
         )
-    except Exception as e:                  # bind down, upstream nack, timeout
+    except Exception as e:                  # bind down, no response, session closed
         log.error(f"submit via {bind} failed: {e}")
+        return pdu.reply(command_status="ESME_RSUBMITFAIL")
+
+    if not resp:                            # upstream answered, and said no
+        log.warning(f"submit via {bind} rejected upstream: {resp.command_status}")
+        if resp.throttled:                  # ESME_RTHROTTLED / ESME_RMSGQFUL
+            return pdu.reply(command_status="ESME_RTHROTTLED")
         return pdu.reply(command_status="ESME_RSUBMITFAIL")
 
     if pdu.registered_delivery and resp.message_id:
@@ -206,13 +212,15 @@ async def _route_dlr(pdu, session):
     ).encode()
 
     try:
-        await smpp.deliver_to(
+        resp = await smpp.deliver_to(
             session_id=raw["esme_session"],
             source_addr=raw["destination_addr"],
             destination_addr=raw["source_addr"],
             short_message=body,
             esm_class=0x04,           # delivery receipt
         )
+        if not resp:                  # the ESME answered, and refused it
+            log.error(f"DLR refused by {raw['esme_system']}: {resp.command_status}")
     except Exception as e:
         log.error(f"DLR delivery to {raw['esme_system']} failed: {e}")
     finally:

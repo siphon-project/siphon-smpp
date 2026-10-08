@@ -86,6 +86,12 @@ fields:
 | `esm_class` | `int` | ESM class bits (`0x04` = delivery receipt, etc.). |
 | `data_coding` | `int` | DCS. |
 | `registered_delivery` | `int` | Whether the sender wants a receipt. |
+| `service_type` | `str` | Service type (§5.2.11); empty for the default. |
+| `priority_flag` | `int` | Priority level (§5.2.14). |
+| `validity_period` | `str` | How long the message stays valid, in the SMPP time format (§7.1.1, absolute or relative); empty for the SMSC default. |
+| `schedule_delivery_time` | `str` | When to first attempt delivery, same format; empty for immediate. |
+| `replace_if_present_flag` | `int` | `1` asks for a pending message with the same addresses to be replaced. |
+| `sm_default_msg_id` | `int` | Index of a canned SMSC message; `0` when unused. |
 | `message_id` | `str` | Present on responses / management PDUs. |
 | `destinations` | `list` | `submit_sm_multi` only — the address list. |
 | `is_dlr` | `bool` | `deliver_sm` only — true if it's a delivery receipt. |
@@ -101,8 +107,16 @@ fields:
 | `pdu.reply()` or returning `None` | Default `ESME_ROK` ack. |
 | `pdu.reply_query(message_state=…, final_date=…, error_code=…)` | Answer a `query_sm`. |
 
-Unknown status strings raise immediately, so a typo fails fast rather than
-silently sending the wrong status.
+`command_status` is what goes on the wire, and it alone decides between accept
+and reject: a `message_id` passed together with a reject status does not turn
+the rejection into an acceptance. Any status name from SMPP 3.4 Table 5-2 is
+accepted. Unknown status strings raise immediately, so a typo fails fast rather
+than silently sending the wrong status.
+
+The validity and scheduling fields are carried by `submit_sm`,
+`submit_sm_multi` and `replace_sm` (which has no `replace_if_present_flag`).
+A `deliver_sm` has them in its layout too, but SMPP 3.4 §4.6.1 requires them
+NULL there, so expect them empty. They are empty / `0` on the other commands.
 
 **The `receipt` dict** (for `deliver_sm` where `is_dlr`):
 
@@ -166,7 +180,12 @@ resp = await smpp.submit_via(
     data_coding=pdu.data_coding,
     registered_delivery=pdu.registered_delivery,
 )
-# resp.ok, resp.command_status, resp.message_id
+if resp:                                  # the SMSC answered ESME_ROK
+    upstream_id = resp.message_id
+elif resp.throttled:                      # ESME_RTHROTTLED / ESME_RMSGQFUL
+    ...                                   # back off and retry later
+else:
+    log.warning(f"rejected: {resp.command_status}")
 ```
 
 ### Inbound — to a bound ESME (by session_id)
@@ -178,26 +197,71 @@ resp = await smpp.submit_via(
 | `alert_to(session_id, …)` | `alert_notification` |
 
 ```python
-await smpp.deliver_to(
+resp = await smpp.deliver_to(
     session_id=esme_session,
     source_addr=pdu.destination_addr,
     destination_addr=pdu.source_addr,
     short_message=receipt_body,           # bytes
     esm_class=0x04,                       # delivery receipt
 )
+if not resp:                              # e.g. ESME_RX_T_APPN: keep it, retry
+    ...
 ```
 
 ### Response objects
 
-| Type | Fields |
-|---|---|
-| `SmppResp` | `ok` (bool), `command_status` (str), `message_id` (str) |
-| `QueryResp` | `message_state`, `final_date`, `error_code` |
+A send helper has three kinds of outcome, and they are kept apart.
 
-Send helpers raise on hard failures (bind not up, timeout); check `resp.ok` /
-`resp.command_status` for a soft nack from the peer. Wrap outbound sends in
-`try/except` and translate failures into a reply status for the originating ESME
-— see the [gateway example](cookbook/smsc-gateway.md#mo-submit_sm-from-an-esme).
+**The peer answered.** You get a response object carrying the
+`command_status` from the response PDU, whatever it was. **A response is not an
+acceptance**: the object is truthy only for `ESME_ROK`.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `ok` | `bool` | `True` only for `ESME_ROK`. `bool(resp)` is the same thing. |
+| `command_status` | `str` | Status name, e.g. `"ESME_RTHROTTLED"`. A value outside SMPP 3.4 Table 5-2 (reserved or vendor-specific) reads as its hex literal, e.g. `"0x00000401"`. |
+| `command_status_code` | `int` | The same status as the number that was on the wire. |
+| `throttled` | `bool` | `True` for `ESME_RTHROTTLED` and `ESME_RMSGQFUL` — the peer wants you to back off. The message was not accepted. |
+| `message_id` | `str` | The SMSC-assigned id (`submit_via`, `submit_multi_via`, `query_via`). Empty for the other helpers, and whenever the status is not `ESME_ROK` — a rejected `submit_sm_resp` has no body. |
+
+`QueryResp` adds `message_state`, `final_date` and `error_code`, which are only
+meaningful when `ok`.
+
+**Nothing usable came back.** The helper raises `smpp.SmppSendError`, a
+`RuntimeError` subclass. Its `reason` says which case it was:
+
+| `reason` | Meaning | Was the message taken? |
+|---|---|---|
+| `"timeout"` | No response within the session's `response_timer_ms`. | Unknown. |
+| `"closed"` | The session ended while the request was outstanding (peer closed, enquire-link failure, unbind). | Unknown. |
+| `"nack"` | The peer answered `generic_nack`. `command_status` / `command_status_code` on the exception carry its status. | No. |
+| `"unanswered"` | The session reported a failure without a response while it was still up — in practice a `generic_nack` carrying `ESME_RSYSERR`, which is not distinguishable from a failed write at this layer. | Not acknowledged; treat as not taken. |
+
+The exception also carries `command` (e.g. `"submit_sm"`).
+
+**The session was not there to begin with.** `KeyError`: the bind is not
+currently bound (it may be mid-reconnect), or no ESME session has that
+`session_id`.
+
+```python
+try:
+    resp = await smpp.submit_via(bind="aggregator-eu", ...)
+except smpp.SmppSendError as e:
+    if e.reason in ("timeout", "closed"):
+        ...                               # outcome unknown: retrying may duplicate
+    else:
+        ...                               # not taken: safe to retry or re-route
+except KeyError:
+    ...                                   # bind down: try the next route
+else:
+    if not resp:
+        ...                               # rejected: resp.command_status says why
+```
+
+`max_msg_per_sec` on a bind paces what you send. It does not react to what the
+peer answers: an `ESME_RTHROTTLED` response is handed to you as above and the
+pacing carries on at the configured rate, so backing off further is the script's
+call. See the [gateway example](cookbook/smsc-gateway.md#mo-submit_sm-from-an-esme).
 
 ## Config readouts
 

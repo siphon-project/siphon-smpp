@@ -186,12 +186,17 @@ Key points:
   `alert_to` target a bound ESME by `session_id`.
 - **Replies**: `pdu.reply(message_id="…")` to accept, `pdu.reply(command_status=
   "ESME_RSUBMITFAIL")` to reject, `pdu.reply()` / `None` for a default
-  `ESME_ROK` ack. Unknown status strings raise immediately.
+  `ESME_ROK` ack. The status is what goes on the wire and alone decides accept
+  or reject. Unknown status strings raise immediately.
 - **`@smpp.on_session("bound" | "unbound")`** fires for both inbound ESME and
   outbound bind lifecycle; the handler receives a `Session`.
 - **Send helpers** (all `await`): most return an `SmppResp` (`command_status`,
-  `message_id`, `ok`); `query_via` returns a `QueryResp` (`message_state`,
-  `final_date`, `error_code`).
+  `command_status_code`, `message_id`, `ok`, `throttled`); `query_via` returns
+  a `QueryResp` (adds `message_state`, `final_date`, `error_code`). The result
+  carries the peer's own `command_status` and is **truthy only for
+  `ESME_ROK`** — check it, a response is not an acceptance. No response at all
+  (timeout, session closed, `generic_nack`) raises `smpp.SmppSendError` with a
+  `reason`.
   - outbound, by bind name: `submit_via`, `submit_multi_via`, `data_via`,
     `cancel_via`, `query_via`, `replace_via`;
   - inbound, by `session_id`: `deliver_to`, `data_to`, `alert_to`.
