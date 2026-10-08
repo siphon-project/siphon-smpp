@@ -927,6 +927,13 @@ pub(crate) fn parse_smpp_status(s: &str) -> PyResult<SmppError> {
         "ESME_RX_P_APPN" => ESME_RX_P_APPN,
         "ESME_RX_R_APPN" => ESME_RX_R_APPN,
         "ESME_RQUERYFAIL" => ESME_RQUERYFAIL,
+        "ESME_RINVOPTPARSTREAM" => ESME_RINVOPTPARSTREAM,
+        "ESME_ROPTPARNOTALLWD" => ESME_ROPTPARNOTALLWD,
+        "ESME_RINVPARLEN" => ESME_RINVPARLEN,
+        "ESME_RMISSINGOPTPARAM" => ESME_RMISSINGOPTPARAM,
+        "ESME_RINVOPTPARAMVAL" => ESME_RINVOPTPARAMVAL,
+        "ESME_RDELIVERYFAILURE" => ESME_RDELIVERYFAILURE,
+        "ESME_RUNKNOWNERR" => ESME_RUNKNOWNERR,
         other => {
             return Err(PyValueError::new_err(format!(
                 "unknown SMPP status: {other:?}"
@@ -982,6 +989,19 @@ mod tests {
                 parse_smpp_status("ESME_RX_T_APPN").unwrap(),
                 SmppError::ESME_RX_T_APPN
             );
+        });
+    }
+
+    #[test]
+    fn every_table_5_2_status_can_be_named_in_a_reply() {
+        // A handler picks its reject status by name, so a status missing
+        // here is one a script cannot send at all.
+        Python::attach(|_py| {
+            for (name, code) in crate::outcome::TABLE_5_2 {
+                let parsed = parse_smpp_status(name)
+                    .unwrap_or_else(|e| panic!("{name} is a Table 5-2 status: {e}"));
+                assert_eq!(parsed as u32, *code, "{name}");
+            }
         });
     }
 
