@@ -91,6 +91,9 @@ check the result start seeing rejections; scripts that do not check it need to.
 - The egress `max_msg_per_sec` limiter is unchanged: it paces what is sent and
   takes no account of what the peer answers. A throttled response is surfaced to
   the script, which decides whether to back off further.
+- Dependency bumps merged ahead of this: `siphon-sip` 1.5.1 → 1.13.0, and the
+  cargo-minor-patch group (pyo3 0.29.2 → 0.29.3, tokio 1.53.1 → 1.53.2,
+  thiserror 2.0.20 → 2.0.21).
 
 ### Known limits
 
