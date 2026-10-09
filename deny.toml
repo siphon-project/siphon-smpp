@@ -54,7 +54,9 @@ skip = [
     # Independent major bumps that have not finished propagating.
     { crate = "base64", reason = "0.22 via reqwest/hyper-util/postgres, 0.23 direct" },
     { crate = "hashbrown", reason = "0.14 transitive, 0.17 current" },
+    { crate = "linux-raw-sys", reason = "follows rustix 0.38/1.x" },
     { crate = "nom", reason = "7.x transitive, 8.x current" },
+    { crate = "rustix", reason = "0.38 via prometheus/procfs, 1.x via tempfile" },
     { crate = "syn", reason = "2.x proc-macro deps, 3.x current" },
     { crate = "thiserror", reason = "1.x transitive, 2.x current" },
     { crate = "thiserror-impl", reason = "1.x transitive, 2.x current" },
