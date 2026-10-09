@@ -222,8 +222,17 @@ async def on_submit(pdu, session):
             # fragments the far end can't reassemble.
             **_relay_kwargs(pdu),
         )
-    except Exception as e:  # bind not up, upstream nack, timeout, …
+    except Exception as e:  # bind not up, no response, session closed, …
         log.error(f"submit via {bind} failed: {e}")
+        return pdu.reply(command_status="ESME_RSUBMITFAIL")
+
+    # A response arriving is not the upstream accepting the message: resp is
+    # falsy unless it answered ESME_ROK. Tell the ESME what happened rather
+    # than handing it an id for a message nobody took.
+    if not resp:
+        log.warning(f"submit via {bind} rejected upstream: {resp.command_status}")
+        if resp.throttled:  # ESME_RTHROTTLED / ESME_RMSGQFUL: ask it to back off too
+            return pdu.reply(command_status="ESME_RTHROTTLED")
         return pdu.reply(command_status="ESME_RSUBMITFAIL")
 
     log.info(
@@ -287,7 +296,7 @@ async def _route_dlr(pdu, session):
         receipt_tlvs["MESSAGE_STATE"] = state
 
     try:
-        await smpp.deliver_to(
+        resp = await smpp.deliver_to(
             session_id=esme_session,
             source_addr=raw["destination_addr"],
             destination_addr=raw["source_addr"],
@@ -295,7 +304,14 @@ async def _route_dlr(pdu, session):
             esm_class=0x04,  # delivery receipt
             tlvs=receipt_tlvs,
         )
-        log.info(f"DLR routed to {raw['esme_system']}: {receipt.get('stat')}")
+        if resp:
+            log.info(f"DLR routed to {raw['esme_system']}: {receipt.get('stat')}")
+        else:
+            # The ESME answered, and refused it. A real gateway would keep
+            # the receipt and retry on ESME_RX_T_APPN.
+            log.error(
+                f"DLR refused by {raw['esme_system']}: {resp.command_status}"
+            )
     except Exception as e:
         log.error(f"DLR delivery to {raw['esme_system']} failed: {e}")
     finally:
@@ -316,7 +332,7 @@ async def _route_mo_reply(pdu, session):
         log.warning(f"owner {owner} for {pdu.destination_addr} is not bound; dropping/queueing")
         return
     try:
-        await smpp.deliver_to(
+        resp = await smpp.deliver_to(
             session_id=esme_session,
             source_addr=pdu.source_addr,
             source_addr_ton=pdu.source_addr_ton,
@@ -326,7 +342,10 @@ async def _route_mo_reply(pdu, session):
             data_coding=pdu.data_coding,
             **_relay_kwargs(pdu),
         )
-        log.info(f"MO {pdu.source_addr} -> {pdu.destination_addr} delivered to {owner}")
+        if resp:
+            log.info(f"MO {pdu.source_addr} -> {pdu.destination_addr} delivered to {owner}")
+        else:
+            log.error(f"MO refused by {owner}: {resp.command_status}")
     except Exception as e:
         log.error(f"MO delivery to {owner} failed: {e}")
 
@@ -345,7 +364,7 @@ async def on_data(pdu, session):
         return pdu.reply(command_status="ESME_RINVDSTADR")
 
     try:
-        await smpp.data_via(
+        resp = await smpp.data_via(
             bind=bind,
             source_addr=pdu.source_addr,
             source_addr_ton=pdu.source_addr_ton,
@@ -368,6 +387,13 @@ async def on_data(pdu, session):
         return pdu.reply(
             command_status="ESME_RSUBMITFAIL",
             tlvs={"ADDITIONAL_STATUS_INFO_TEXT": "upstream relay failed"},
+        )
+
+    if not resp:
+        log.warning(f"data_sm via {bind} rejected upstream: {resp.command_status}")
+        return pdu.reply(
+            command_status="ESME_RSUBMITFAIL",
+            tlvs={"ADDITIONAL_STATUS_INFO_TEXT": f"upstream: {resp.command_status}"},
         )
 
     log.info(

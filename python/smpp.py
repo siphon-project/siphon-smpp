@@ -36,6 +36,26 @@ Send helpers (all async — `await` them):
     * alert_to(session_id=…, source_addr=…, esme_addr=…, **fields)
 All are attached as Rust pyfunctions at namespace-init time.
 
+What a send helper hands back
+-----------------------------
+The peer answering is not the peer accepting. Each helper returns the
+response as the peer sent it:
+
+    resp = await smpp.submit_via(bind="upstream", ...)
+    if resp:                      # ESME_ROK, and only ESME_ROK
+        ...resp.message_id...
+    elif resp.throttled:          # ESME_RTHROTTLED / ESME_RMSGQFUL
+        ...back off...
+    else:
+        ...resp.command_status / resp.command_status_code say why...
+
+If no response PDU came back the helper raises `SmppSendError` (a
+`RuntimeError`), with `.reason` set to "timeout", "closed", "nack" (a
+generic_nack; `.command_status` carries its status) or "unanswered". After
+"timeout" or "closed" it is not known whether the peer took the message.
+A bind or session that is not bound raises `KeyError` before anything is
+sent.
+
 Optional parameters (TLVs, SMPP 3.4 §3.2.1 / §5.3.2)
 ----------------------------------------------------
 submit_via, submit_multi_via, data_via, deliver_to and data_to all take
@@ -234,6 +254,11 @@ def routing_rules():
 #   AlertNotification — passed into @on_pdu("alert_notification");
 #                        .source_addr / .esme_addr / .ms_availability_status
 #   SmppResp          — return value from most send helpers
-#                        (.command_status / .message_id / .ok)
+#                        (.command_status / .command_status_code /
+#                        .message_id / .ok / .throttled; falsy unless ESME_ROK)
 #   QueryResp         — return value from query_via
-#                        (.message_state / .final_date / .error_code / .ok)
+#                        (as SmppResp, plus .message_state / .final_date /
+#                        .error_code)
+#   SmppSendError     — raised by a send helper that got no response PDU
+#                        (.reason / .command / .command_status /
+#                        .command_status_code)

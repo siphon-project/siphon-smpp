@@ -63,6 +63,10 @@ pub(crate) struct State {
     /// What to do when an inbound submit exceeds `inbound_max_mps`:
     /// pace (delay the resp) or reject with `ESME_RTHROTTLED`.
     pub inbound_throttle_action: ThrottleAction,
+    /// `server.response_timer_ms`: how long a request we send to a bound
+    /// ESME waits for its response. Copied onto each [`EsmeSession`] so
+    /// the send helpers can tell a timeout from a session that closed.
+    pub inbound_response_timer: std::time::Duration,
     /// Set by [`SmppServerListener::on_listen_failed`] when the listening
     /// socket could not be bound. Terminal: no connection is ever accepted
     /// after it, so the server task reports it and stops instead of parking
@@ -80,6 +84,9 @@ pub(crate) struct BindSession {
     /// Per-bind outbound rate limiter (`max_msg_per_sec`); `None` when
     /// unlimited.
     pub throttle: Option<Arc<RateLimiter>>,
+    /// The bind's `response_timer_ms` — the same value the session was
+    /// started with, kept here because `SMSC` does not expose it.
+    pub response_timer: std::time::Duration,
 }
 
 /// A bound inbound ESME session (an ESME that connected to *us*).
@@ -92,6 +99,31 @@ pub(crate) struct EsmeSession {
     /// `submit_sm_multi` (paced or rejected per `server.throttle_action`)
     /// — the ingress mirror of `BindSession::throttle`.
     pub throttle: Option<Arc<RateLimiter>>,
+    /// `server.response_timer_ms`, as the session was started with.
+    pub response_timer: std::time::Duration,
+}
+
+/// True when `smsc` is no longer a registered outbound session — it was
+/// removed by [`SmppClientListener::on_smsc_unbound`]. smpp34 awaits that
+/// hook before it releases the requests still outstanding on the session,
+/// so a send helper that sees its request fail can ask here whether the
+/// session ending is why.
+pub(crate) async fn bind_gone(binds: &Mutex<Vec<BindSession>>, smsc: &Arc<SMSC>) -> bool {
+    !binds
+        .lock()
+        .await
+        .iter()
+        .any(|b| Arc::ptr_eq(&b.smsc, smsc))
+}
+
+/// The inbound mirror of [`bind_gone`]: true once
+/// [`SmppServerListener::on_esme_unbound`] has dropped `esme`.
+pub(crate) async fn esme_gone(esmes: &Mutex<Vec<EsmeSession>>, esme: &Arc<ESME>) -> bool {
+    !esmes
+        .lock()
+        .await
+        .iter()
+        .any(|e| Arc::ptr_eq(&e.esme, esme))
 }
 
 pub(crate) static STATE: OnceLock<Arc<State>> = OnceLock::new();
@@ -189,6 +221,7 @@ pub fn spawn(cfg: SmppConfig, script: ScriptHandle) {
         esmes: Mutex::new(Vec::new()),
         inbound_max_mps: cfg.server.max_msg_per_sec,
         inbound_throttle_action: cfg.server.throttle_action,
+        inbound_response_timer: std::time::Duration::from_millis(cfg.server.response_timer_ms),
         listen_failure: OnceLock::new(),
         script: script.clone(),
     });
@@ -302,6 +335,7 @@ async fn run_bind_loop(state: Arc<State>, cfg: BindConfig) {
         state: state.clone(),
         bind_name: cfg.name.clone(),
         max_msg_per_sec: cfg.max_msg_per_sec,
+        response_timer: std::time::Duration::from_millis(cfg.response_timer_ms),
         connect_failed: connect_failed.clone(),
     });
 
@@ -489,16 +523,16 @@ impl SmppServerListener for State {
         let pdu = Pdu::from_submit(&request);
         let session = self.esme_session(session_id, conn).await;
         match dispatch_pdu(&self.script, "submit_sm", pdu, session).await {
-            Ok(reply) => match reply.message_id {
-                Some(id) => {
-                    metrics::record_pdu(metrics::INBOUND, "submit_sm", metrics::ACCEPTED);
-                    request.accept(id)
-                }
-                None => {
-                    metrics::record_pdu(metrics::INBOUND, "submit_sm", metrics::REJECTED);
-                    request.reject(reply.command_status)
-                }
-            },
+            Ok(reply) => {
+                let resp = submit_sm_response(request, reply);
+                let result = if resp.is_success() {
+                    metrics::ACCEPTED
+                } else {
+                    metrics::REJECTED
+                };
+                metrics::record_pdu(metrics::INBOUND, "submit_sm", result);
+                resp
+            }
             Err(e) => {
                 tracing::error!(target: "siphon_smpp",
                     error=%e, "@smpp.on_pdu(submit_sm) raised");
@@ -529,22 +563,14 @@ impl SmppServerListener for State {
                 request.reject(SmppError::ESME_RSYSERR)
             }
             Some(Ok(reply)) => {
-                let tlvs = reply.tlvs.clone();
-                let resp = match reply.message_id {
-                    Some(id) => {
-                        metrics::record_pdu(metrics::INBOUND, "data_sm", metrics::ACCEPTED);
-                        request.accept(id)
-                    }
-                    None if reply.command_status == SmppError::ESME_ROK => {
-                        metrics::record_pdu(metrics::INBOUND, "data_sm", metrics::ACCEPTED);
-                        request.accept(String::new())
-                    }
-                    None => {
-                        metrics::record_pdu(metrics::INBOUND, "data_sm", metrics::REJECTED);
-                        request.reject(reply.command_status)
-                    }
+                let resp = data_sm_response(request, reply);
+                let result = if resp.is_success() {
+                    metrics::ACCEPTED
+                } else {
+                    metrics::REJECTED
                 };
-                with_resp_tlvs(resp, tlvs)
+                metrics::record_pdu(metrics::INBOUND, "data_sm", result);
+                resp
             }
             Some(Err(e)) => {
                 tracing::error!(target: "siphon_smpp",
@@ -717,6 +743,7 @@ impl SmppServerListener for State {
         self.esmes.lock().await.push(EsmeSession {
             esme: Arc::new(esme),
             throttle,
+            response_timer: self.inbound_response_timer,
         });
         dispatch_session(&self.script, "bound", session).await;
     }
@@ -821,6 +848,8 @@ struct BindListener {
     state: Arc<State>,
     bind_name: String,
     max_msg_per_sec: u32,
+    /// The bind's `response_timer_ms`, recorded on each session it brings up.
+    response_timer: std::time::Duration,
     /// Raised by [`SmppClientListener::on_connection_failed`] when an
     /// attempt never reached a session. The supervisor clears it before
     /// each attempt and watches it during the bind wait, so a refused
@@ -890,14 +919,15 @@ impl SmppClientListener for BindListener {
                 metrics::record_pdu(metrics::EGRESS, "data_sm", metrics::REJECTED);
                 request.reject(SmppError::ESME_RSYSERR)
             }
-            Some(Ok(reply)) if reply.command_status == SmppError::ESME_ROK => {
-                metrics::record_pdu(metrics::EGRESS, "data_sm", metrics::ACCEPTED);
-                let tlvs = reply.tlvs.clone();
-                with_resp_tlvs(request.accept(reply.message_id.unwrap_or_default()), tlvs)
-            }
             Some(Ok(reply)) => {
-                metrics::record_pdu(metrics::EGRESS, "data_sm", metrics::REJECTED);
-                with_resp_tlvs(request.reject(reply.command_status), reply.tlvs)
+                let resp = data_sm_response(request, reply);
+                let result = if resp.is_success() {
+                    metrics::ACCEPTED
+                } else {
+                    metrics::REJECTED
+                };
+                metrics::record_pdu(metrics::EGRESS, "data_sm", result);
+                resp
             }
             Some(Err(e)) => {
                 tracing::error!(target: "siphon_smpp",
@@ -962,6 +992,7 @@ impl SmppClientListener for BindListener {
             name: self.bind_name.clone(),
             smsc: Arc::new(smsc),
             throttle,
+            response_timer: self.response_timer,
         });
         dispatch_session(&self.state.script, "bound", session).await;
     }
@@ -1009,6 +1040,36 @@ fn with_resp_tlvs(mut resp: data_sm_resp, tlvs: Vec<smpp34::Tlv>) -> data_sm_res
         resp.push_tlv(tlv);
     }
     resp
+}
+
+/// Turn a handler's reply to a `submit_sm` into the response we send.
+///
+/// The reply's `command_status` decides, and nothing else does: a
+/// `message_id` handed back alongside a reject status does not turn the
+/// rejection into an acceptance. An acceptance always carries a
+/// `message_id` body — empty when the handler gave none — because the
+/// field is mandatory in an `ESME_ROK` `submit_sm_resp` (§4.4.2) and a
+/// bare header is a malformed PDU the ESME cannot decode.
+fn submit_sm_response(request: submit_sm, reply: PduReply) -> submit_sm_resp {
+    if reply.command_status == SmppError::ESME_ROK {
+        request.accept(reply.message_id.unwrap_or_default())
+    } else {
+        request.reject(reply.command_status)
+    }
+}
+
+/// Turn a handler's reply to a `data_sm` into the response we send, on
+/// either kind of session. As with [`submit_sm_response`] the reply's
+/// `command_status` alone decides. `reply(tlvs=…)` rides along either
+/// way: the optional parameters of a `data_sm_resp` (§4.7.2) are mostly
+/// there to explain a failure.
+fn data_sm_response(request: data_sm, reply: PduReply) -> data_sm_resp {
+    let resp = if reply.command_status == SmppError::ESME_ROK {
+        request.accept(reply.message_id.unwrap_or_default())
+    } else {
+        request.reject(reply.command_status)
+    };
+    with_resp_tlvs(resp, reply.tlvs)
 }
 
 /// Dispatch a PDU to its `@smpp.on_pdu("<command>")` handler. If no
@@ -1292,6 +1353,134 @@ mod tests {
         // before the optional parameters.
         let command_length = u32::from_be_bytes([wire[0], wire[1], wire[2], wire[3]]);
         assert_eq!(command_length as usize, wire.len());
+    }
+
+    // ── The status a handler chose is the status on the wire ────────
+
+    fn a_submit_sm() -> submit_sm {
+        submit_sm::new(
+            7,
+            String::new(),
+            1,
+            1,
+            "5550100".into(),
+            1,
+            1,
+            "5550199".into(),
+            0,
+            0,
+            0,
+            String::new(),
+            String::new(),
+            0,
+            0,
+            0,
+            0,
+            b"hello".to_vec(),
+        )
+    }
+
+    fn reply(command_status: SmppError, message_id: Option<&str>) -> PduReply {
+        PduReply {
+            command_status,
+            message_id: message_id.map(str::to_string),
+            ..PduReply::default_ok()
+        }
+    }
+
+    /// A `submit_sm_resp` for sequence number 7, written out from §4.4.2.
+    fn submit_sm_resp_wire(command_status: u32, body: &[u8]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&((16 + body.len()) as u32).to_be_bytes());
+        wire.extend_from_slice(&0x8000_0004u32.to_be_bytes());
+        wire.extend_from_slice(&command_status.to_be_bytes());
+        wire.extend_from_slice(&7u32.to_be_bytes());
+        wire.extend_from_slice(body);
+        wire
+    }
+
+    #[test]
+    fn an_accepted_submit_sm_is_answered_rok_with_the_message_id() {
+        let wire =
+            submit_sm_response(a_submit_sm(), reply(SmppError::ESME_ROK, Some("abc"))).encode();
+        assert_eq!(wire, submit_sm_resp_wire(0, b"abc\0"));
+    }
+
+    #[test]
+    fn a_rejected_submit_sm_is_answered_with_the_status_the_handler_chose() {
+        let wire =
+            submit_sm_response(a_submit_sm(), reply(SmppError::ESME_RINVDSTADR, None)).encode();
+        // §4.4.2: no body with a non-zero status.
+        assert_eq!(wire, submit_sm_resp_wire(0x0000_000B, &[]));
+    }
+
+    #[test]
+    fn a_reject_status_is_not_overridden_by_a_message_id() {
+        // A handler that allocates its id up front and then decides to
+        // throttle hands back both. The status is the verdict; answering
+        // ESME_ROK here would tell the ESME its message was taken.
+        let wire = submit_sm_response(
+            a_submit_sm(),
+            reply(SmppError::ESME_RTHROTTLED, Some("abc")),
+        )
+        .encode();
+        assert_eq!(wire, submit_sm_resp_wire(0x0000_0058, &[]));
+    }
+
+    #[test]
+    fn an_accept_without_a_message_id_still_has_its_mandatory_body() {
+        // `pdu.reply()`, a handler returning None and the no-handler
+        // default all land here. message_id is mandatory in an ESME_ROK
+        // submit_sm_resp (§4.4.2), so it goes out as an empty C-Octet
+        // String, not as a header with nothing behind it.
+        let wire = submit_sm_response(a_submit_sm(), PduReply::default_ok()).encode();
+        assert_eq!(wire, submit_sm_resp_wire(0, &[0x00]));
+    }
+
+    /// A `data_sm_resp` for sequence number 42, written out from §4.7.2.
+    fn data_sm_resp_wire(command_status: u32, body: &[u8]) -> Vec<u8> {
+        let mut wire = Vec::new();
+        wire.extend_from_slice(&((16 + body.len()) as u32).to_be_bytes());
+        wire.extend_from_slice(&0x8000_0103u32.to_be_bytes());
+        wire.extend_from_slice(&command_status.to_be_bytes());
+        wire.extend_from_slice(&42u32.to_be_bytes());
+        wire.extend_from_slice(body);
+        wire
+    }
+
+    #[test]
+    fn an_accepted_data_sm_is_answered_rok_with_the_message_id() {
+        let wire = data_sm_response(a_data_sm(), reply(SmppError::ESME_ROK, Some("abc"))).encode();
+        assert_eq!(wire, data_sm_resp_wire(0, b"abc\0"));
+    }
+
+    #[test]
+    fn a_data_sm_reject_status_is_not_overridden_by_a_message_id() {
+        let wire =
+            data_sm_response(a_data_sm(), reply(SmppError::ESME_RX_T_APPN, Some("abc"))).encode();
+        assert_eq!(&wire[4..12], &data_sm_resp_wire(0x0000_0064, &[])[4..12]);
+        assert!(
+            !wire.windows(3).any(|w| w == b"abc"),
+            "a rejected data_sm must not carry the id of an accepted one: {wire:02x?}"
+        );
+    }
+
+    #[test]
+    fn a_rejected_data_sm_keeps_the_optional_parameters_that_explain_it() {
+        let mut rejection = reply(SmppError::ESME_RDELIVERYFAILURE, None);
+        rejection.tlvs = vec![smpp34::Tlv::from_u8(
+            smpp34::TlvTag::DeliveryFailureReason,
+            1,
+        )];
+        let wire = data_sm_response(a_data_sm(), rejection).encode();
+        assert_eq!(&wire[8..12], &0x0000_00FEu32.to_be_bytes());
+        // §5.3.2.33: tag 0x0425, length 1, value 1.
+        let expected_tlv = [0x04u8, 0x25, 0x00, 0x01, 0x01];
+        assert!(wire.windows(5).any(|w| w == expected_tlv), "{wire:02x?}");
+        assert_eq!(
+            u32::from_be_bytes([wire[0], wire[1], wire[2], wire[3]]) as usize,
+            wire.len()
+        );
     }
 
     #[test]
