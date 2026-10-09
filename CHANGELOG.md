@@ -7,7 +7,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-## [1.6.0] — Unreleased
+## [1.6.0] — 2026-10-09
 
 **Read this before upgrading.** A send that used to be reported as accepted can
 now be reported as rejected, because it was rejected all along. Scripts that
