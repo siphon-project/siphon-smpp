@@ -158,7 +158,7 @@ fn mapping_cycle(iters: usize) {
 
 fn config_cycle(iters: usize) {
     for _ in 0..iters {
-        let cfg: SmppConfig = serde_yaml::from_str(SAMPLE_YAML).unwrap();
+        let cfg: SmppConfig = SmppConfig::from_yaml(SAMPLE_YAML).unwrap();
         std::hint::black_box(cfg.listen());
         std::hint::black_box(cfg);
     }

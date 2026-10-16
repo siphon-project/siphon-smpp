@@ -151,9 +151,9 @@ fn build_config_dict<'py>(py: Python<'py>, cfg: &SmppConfig) -> PyResult<Bound<'
         r.set_item("chain", chain)?;
         let opts = PyDict::new(py);
         for (k, v) in &rule.options {
-            // serde_yaml::Value → JSON-ish PyAny. Cheap path: stringify
-            // and let the script treat as opaque metadata.
-            opts.set_item(k, serde_yaml::to_string(v).unwrap_or_default())?;
+            // Any YAML node → its YAML text. Cheap path: stringify and
+            // let the script treat it as opaque metadata.
+            opts.set_item(k, v.to_yaml().unwrap_or_default())?;
         }
         r.set_item("options", opts)?;
         rules.append(r)?;
@@ -170,9 +170,40 @@ mod tests {
     use pyo3::exceptions::PyRuntimeError;
 
     #[test]
+    fn rule_options_reach_the_script_as_yaml_text() {
+        let yaml = "routing:\n  rules:\n    - prefix: \"1555\"\n      chain: [bind:a]\n      options:\n        rate_cap: 10\n        label: north\n        flag: yes\n        unset: ~\n        ratio: 1.50\n        ceiling: .inf\n        tags: [1, two, true]\n        nested: {k: v, n: 2}\n";
+        let cfg = SmppConfig::from_yaml(yaml).expect("options load");
+        Python::attach(|py| {
+            // Build the dict directly: every namespace() call execs into the
+            // one sys.modules["smpp"], so reading `_config` back off the module
+            // races the other tests that build a namespace.
+            let rules: Vec<Bound<'_, PyDict>> = build_config_dict(py, &cfg)
+                .and_then(|c| c.as_any().get_item("routing"))
+                .and_then(|r| r.get_item("rules"))
+                .and_then(|r| r.extract())
+                .expect("rules list");
+            let options: std::collections::HashMap<String, String> = rules[0]
+                .get_item("options")
+                .ok()
+                .flatten()
+                .and_then(|o| o.extract().ok())
+                .expect("options dict");
+            let text = |key: &str| -> String { options[key].clone() };
+            assert_eq!(text("rate_cap"), "10\n");
+            assert_eq!(text("label"), "north\n");
+            assert_eq!(text("flag"), "yes\n");
+            assert_eq!(text("unset"), "null\n");
+            assert_eq!(text("ratio"), "1.5\n");
+            assert_eq!(text("ceiling"), ".inf\n");
+            assert_eq!(text("tags"), "- 1\n- two\n- true\n");
+            assert_eq!(text("nested"), "k: v\nn: 2\n");
+        });
+    }
+
+    #[test]
     fn the_namespace_exposes_the_send_error_as_a_runtime_error() {
         Python::attach(|py| {
-            let cfg: SmppConfig = serde_yaml::from_str("{}").expect("empty config");
+            let cfg: SmppConfig = SmppConfig::from_yaml("{}").expect("empty config");
             let module = namespace(cfg)(py).expect("namespace builds");
             let module = module.bind(py);
             let error = module.getattr("SmppSendError").expect("smpp.SmppSendError");

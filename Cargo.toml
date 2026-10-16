@@ -2,7 +2,7 @@
 name = "siphon-smpp"
 version = "1.6.0"
 edition = "2021"
-rust-version = "1.80"
+rust-version = "1.89"
 description = "SMPP 3.4 addon for siphon — exposes a scriptable `smpp` namespace to Python"
 authors = ["SIPhon Contributors"]
 license = "MIT"
@@ -39,7 +39,8 @@ tokio = { version = "1", features = ["full"] }
 async-trait = "0.1"
 tracing = "0.1"
 serde = { version = "1", features = ["derive"] }
-serde_yaml = "0.9"
+serde-saphyr = { version = "2.0.0", default-features = false, features = ["deserialize", "serialize"] }
+serde_path_to_error = "0.1.20"
 thiserror = "2"
 
 [dev-dependencies]
