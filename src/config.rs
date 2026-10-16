@@ -11,7 +11,9 @@
 //!
 //! The config dict is exposed to the script as `siphon.smpp.config()`.
 
-use serde::Deserialize;
+use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
+use serde::ser::{SerializeMap, SerializeSeq, Serializer};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -117,20 +119,24 @@ pub struct BindConfig {
     /// Bind identifier. Referenced from routing chains as
     /// `bind:<name>` and from the script as `await
     /// smpp.submit_via(bind="<name>", …)`.
+    #[serde(deserialize_with = "string_or_null")]
     pub name: String,
 
+    #[serde(deserialize_with = "string_or_null")]
     pub host: String,
     pub port: u16,
 
+    #[serde(deserialize_with = "string_or_null")]
     pub system_id: String,
+    #[serde(deserialize_with = "string_or_null")]
     pub password: String,
 
     /// Optional SMPP system_type. Many aggregators ignore it.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_or_null")]
     pub system_type: String,
 
     /// "transmitter" | "receiver" | "transceiver". Default: transceiver.
-    #[serde(default = "default_bind_type")]
+    #[serde(default = "default_bind_type", deserialize_with = "string_or_null")]
     pub bind_type: String,
 
     /// Optional throughput cap (msg/s). 0 = unlimited.
@@ -149,7 +155,7 @@ pub struct BindConfig {
 pub struct RoutingConfig {
     /// Chain tried for any destination not matching a specific rule.
     /// Step values: "ims" | "ss7" | "sgd" | "queue" | "bind:<name>".
-    #[serde(default)]
+    #[serde(default, deserialize_with = "strings_or_null")]
     pub default_chain: Vec<String>,
 
     /// Prefix-matched rules. Longest-prefix-wins; ties: first wins.
@@ -160,23 +166,156 @@ pub struct RoutingConfig {
 #[derive(Debug, Deserialize, Clone)]
 pub struct RoutingRule {
     /// E.164 prefix without leading `+`. Empty string = catch-all.
+    #[serde(deserialize_with = "string_or_null")]
     pub prefix: String,
     /// Same step grammar as `default_chain`.
+    #[serde(deserialize_with = "strings_or_null")]
     pub chain: Vec<String>,
     /// Optional descriptive name for logs/metrics.
-    #[serde(default)]
+    #[serde(default, deserialize_with = "string_or_null")]
     pub name: String,
     /// Free-form metadata the script may use (e.g. rate caps,
     /// preferred bind on retry).
     #[serde(default)]
-    pub options: BTreeMap<String, serde_yaml::Value>,
+    pub options: BTreeMap<String, OptionValue>,
+}
+
+/// One value under a routing rule's `options:` map. Any YAML node is
+/// accepted; the script receives each one re-serialised as YAML text.
+#[derive(Debug, Clone, PartialEq)]
+pub enum OptionValue {
+    Null,
+    Bool(bool),
+    Int(i64),
+    UInt(u64),
+    Float(f64),
+    String(String),
+    Seq(Vec<OptionValue>),
+    /// Key order is kept as written.
+    Map(Vec<(OptionValue, OptionValue)>),
+}
+
+impl<'de> Deserialize<'de> for OptionValue {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct OptionValueVisitor;
+
+        impl<'de> Visitor<'de> for OptionValueVisitor {
+            type Value = OptionValue;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("any YAML value")
+            }
+            fn visit_unit<E: de::Error>(self) -> Result<OptionValue, E> {
+                Ok(OptionValue::Null)
+            }
+            fn visit_none<E: de::Error>(self) -> Result<OptionValue, E> {
+                Ok(OptionValue::Null)
+            }
+            fn visit_some<D: Deserializer<'de>>(self, d: D) -> Result<OptionValue, D::Error> {
+                OptionValue::deserialize(d)
+            }
+            fn visit_bool<E: de::Error>(self, v: bool) -> Result<OptionValue, E> {
+                Ok(OptionValue::Bool(v))
+            }
+            fn visit_i64<E: de::Error>(self, v: i64) -> Result<OptionValue, E> {
+                Ok(OptionValue::Int(v))
+            }
+            fn visit_u64<E: de::Error>(self, v: u64) -> Result<OptionValue, E> {
+                Ok(OptionValue::UInt(v))
+            }
+            fn visit_f64<E: de::Error>(self, v: f64) -> Result<OptionValue, E> {
+                Ok(OptionValue::Float(v))
+            }
+            fn visit_str<E: de::Error>(self, v: &str) -> Result<OptionValue, E> {
+                Ok(OptionValue::String(v.to_owned()))
+            }
+            fn visit_string<E: de::Error>(self, v: String) -> Result<OptionValue, E> {
+                Ok(OptionValue::String(v))
+            }
+            fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<OptionValue, A::Error> {
+                let mut items = Vec::new();
+                while let Some(item) = seq.next_element()? {
+                    items.push(item);
+                }
+                Ok(OptionValue::Seq(items))
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<OptionValue, A::Error> {
+                let mut entries = Vec::new();
+                while let Some(entry) = map.next_entry()? {
+                    entries.push(entry);
+                }
+                Ok(OptionValue::Map(entries))
+            }
+        }
+
+        deserializer.deserialize_any(OptionValueVisitor)
+    }
+}
+
+impl OptionValue {
+    /// The value as YAML text, the form the script receives it in.
+    ///
+    /// Written with YAML 1.2 quoting rules, so a string such as `yes`, `off`
+    /// or `2001-12-14` comes out bare, as it was written, instead of quoted
+    /// against YAML 1.1 readers.
+    pub fn to_yaml(&self) -> Result<String, serde_saphyr::SerializeError> {
+        let mut options = serde_saphyr::SerializerOptions::default();
+        options.yaml_12 = true;
+        options.no_lang_directive = true;
+        serde_saphyr::to_string_with_options(self, options)
+    }
+}
+
+impl Serialize for OptionValue {
+    fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            OptionValue::Null => serializer.serialize_unit(),
+            OptionValue::Bool(v) => serializer.serialize_bool(*v),
+            OptionValue::Int(v) => serializer.serialize_i64(*v),
+            OptionValue::UInt(v) => serializer.serialize_u64(*v),
+            OptionValue::Float(v) => serializer.serialize_f64(*v),
+            OptionValue::String(v) => serializer.serialize_str(v),
+            OptionValue::Seq(items) => {
+                let mut seq = serializer.serialize_seq(Some(items.len()))?;
+                for item in items {
+                    seq.serialize_element(item)?;
+                }
+                seq.end()
+            }
+            OptionValue::Map(entries) => {
+                let mut map = serializer.serialize_map(Some(entries.len()))?;
+                for (key, value) in entries {
+                    map.serialize_entry(key, value)?;
+                }
+                map.end()
+            }
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone)]
 pub struct TlsConfig {
+    #[serde(deserialize_with = "string_or_null")]
     pub cert_path: String,
+    #[serde(deserialize_with = "string_or_null")]
     pub key_path: String,
     pub ca_path: Option<String>,
+}
+
+/// A string field left empty (`key:`) is the empty string. That is what an
+/// unset `${VAR}` expands to, and it has always loaded as "" rather than a
+/// parse error. YAML 1.2 reads an empty plain scalar (and `~` / `null`) as
+/// null, so read the field as optional and default it.
+fn string_or_null<'de, D: Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    Ok(Option::<String>::deserialize(deserializer)?.unwrap_or_default())
+}
+
+/// [`string_or_null`] for each element of a list of strings.
+fn strings_or_null<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Vec<String>, D::Error> {
+    Ok(Vec::<Option<String>>::deserialize(deserializer)?
+        .into_iter()
+        .map(Option::unwrap_or_default)
+        .collect())
 }
 
 fn default_session_init() -> u64 {
@@ -214,7 +353,9 @@ pub enum ConfigError {
     #[error("parse {path}: {source}")]
     Parse {
         path: String,
-        source: serde_yaml::Error,
+        // Boxed: the parser's error is large, and every Result in here
+        // would otherwise carry its size.
+        source: Box<serde_saphyr::Error>,
     },
     #[error("bind {bind:?} from env: missing SMPP_BIND_{}_{field}", bind.to_uppercase())]
     EnvBindMissing { bind: String, field: &'static str },
@@ -229,6 +370,22 @@ pub enum ConfigError {
 }
 
 impl SmppConfig {
+    /// Parse an `smpp.yaml` document (after `${VAR}` expansion).
+    ///
+    /// Source snippets are left out of parse errors on purpose: the input
+    /// has had environment variables expanded into it, so a snippet could
+    /// carry a bind password into the logs.
+    pub fn from_yaml(yaml: &str) -> Result<Self, serde_saphyr::Error> {
+        let mut options = serde_saphyr::Options::default();
+        options.with_snippet = false;
+        // Only `true` / `false` are booleans; `yes`, `on`, `n` and friends
+        // under a rule's `options:` stay strings, as they always have.
+        options.strict_booleans = true;
+        // `.inf` / `.nan` under a rule's `options:` are values, not errors.
+        options.non_finite_float_policy = serde_saphyr::NonFiniteFloatPolicy::PassThrough;
+        serde_saphyr::from_str_with_options(yaml, options)
+    }
+
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         let raw = std::fs::read_to_string(path).map_err(|source| ConfigError::Read {
@@ -236,11 +393,10 @@ impl SmppConfig {
             source,
         })?;
         let expanded = expand_env_vars(&raw);
-        let mut cfg: Self =
-            serde_yaml::from_str(&expanded).map_err(|source| ConfigError::Parse {
-                path: path.display().to_string(),
-                source,
-            })?;
+        let mut cfg = Self::from_yaml(&expanded).map_err(|source| ConfigError::Parse {
+            path: path.display().to_string(),
+            source: Box::new(source),
+        })?;
         cfg.binds.extend(binds_from_env()?);
         if !cfg.binds.is_empty() {
             let names: Vec<&str> = cfg.binds.iter().map(|t| t.name.as_str()).collect();
@@ -458,7 +614,7 @@ routing:
 
     #[test]
     fn parses_full_config() {
-        let cfg: SmppConfig = serde_yaml::from_str(SAMPLE_YAML).expect("valid YAML");
+        let cfg: SmppConfig = SmppConfig::from_yaml(SAMPLE_YAML).expect("valid YAML");
 
         // server
         assert_eq!(cfg.server.bind_address.as_deref(), Some("127.0.0.1"));
@@ -518,7 +674,7 @@ routing:
     fn empty_config_uses_all_defaults() {
         // An entirely empty document must parse — every top-level field
         // has a `#[serde(default)]`.
-        let cfg: SmppConfig = serde_yaml::from_str("{}").expect("empty maps to defaults");
+        let cfg: SmppConfig = SmppConfig::from_yaml("{}").expect("empty maps to defaults");
         assert!(cfg.binds.is_empty());
         assert!(cfg.routing.default_chain.is_empty());
         assert!(cfg.routing.rules.is_empty());
@@ -541,7 +697,7 @@ routing:
     fn server_timer_field_defaults_apply_when_server_present() {
         // When `server:` exists but timer keys are omitted, the
         // field-level serde defaults kick in.
-        let cfg: SmppConfig = serde_yaml::from_str("server:\n  port: 2775\n").unwrap();
+        let cfg: SmppConfig = SmppConfig::from_yaml("server:\n  port: 2775\n").unwrap();
         assert_eq!(cfg.server.session_init_timer_ms, default_session_init());
         assert_eq!(cfg.server.enquire_link_timer_ms, default_enquire_link());
         assert_eq!(cfg.server.inactivity_timer_ms, default_inactivity());
@@ -572,18 +728,100 @@ binds:
     system_id: x
     password: y
 "#;
-        let err = serde_yaml::from_str::<SmppConfig>(yaml).unwrap_err();
+        let err = SmppConfig::from_yaml(yaml).unwrap_err();
         assert!(
             err.to_string().contains("host"),
             "error should mention the missing field: {err}"
         );
     }
 
+    #[test]
+    fn an_empty_value_in_a_string_field_is_an_empty_string() {
+        // `${VAR}` with VAR unset expands to nothing, leaving `key:` with no
+        // value. That has always loaded as "", not as a parse error.
+        let cfg = SmppConfig::from_yaml(
+            "binds:\n  - name: a\n    host: h.example.net\n    port: 2775\n    system_id:\n    password:\n    system_type:\nrouting:\n  default_chain: [bind:a, ]\n  rules:\n    - prefix:\n      chain: [bind:a]\n",
+        )
+        .expect("empty values load");
+        assert_eq!(cfg.binds[0].system_id, "");
+        assert_eq!(cfg.binds[0].password, "");
+        assert_eq!(cfg.binds[0].system_type, "");
+        assert_eq!(cfg.routing.rules[0].prefix, "");
+    }
+
+    #[test]
+    fn an_unset_variable_in_a_shipped_style_config_still_loads() {
+        let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let path = std::env::temp_dir().join("siphon_smpp_unset_var_test.yaml");
+        std::fs::write(
+            &path,
+            "binds:\n  - name: alpha\n    host: smsc-a.example.net\n    port: 2775\n    system_id: ${SIPHON_SMPP_TEST_UNSET_ID}\n    password: ${SIPHON_SMPP_TEST_UNSET_PW}\n",
+        )
+        .unwrap();
+        let cfg = SmppConfig::from_file(&path).expect("loads");
+        std::fs::remove_file(&path).ok();
+        assert_eq!(cfg.binds[0].system_id, "");
+        assert_eq!(cfg.binds[0].password, "");
+    }
+
+    #[test]
+    fn a_parse_error_does_not_quote_the_config_text() {
+        // The text has had env vars (bind passwords) expanded into it, so an
+        // error message that quotes the offending line would log them.
+        let err = SmppConfig::from_yaml(
+            "binds:\n  - name: a\n    host: h.example.net\n    password: hunter2-secret\n    port: hunter2-secret\n    system_id: x\n",
+        )
+        .unwrap_err();
+        assert!(
+            !err.to_string().contains("hunter2"),
+            "error leaks config text: {err}"
+        );
+    }
+
+    #[test]
+    fn rule_options_keep_any_yaml_value() {
+        let cfg = SmppConfig::from_yaml(
+            "routing:\n  rules:\n    - prefix: \"1555\"\n      chain: [bind:a]\n      options:\n        rate_cap: 10\n        ratio: 0.5\n        label: north\n        enabled: true\n        unset: ~\n        ceiling: .inf\n        tags: [a, 2]\n        nested: {b: 1, a: 2}\n",
+        )
+        .expect("options load");
+        let options = &cfg.routing.rules[0].options;
+        assert_eq!(options["rate_cap"], OptionValue::UInt(10));
+        assert_eq!(options["ratio"], OptionValue::Float(0.5));
+        assert_eq!(options["label"], OptionValue::String("north".into()));
+        assert_eq!(options["enabled"], OptionValue::Bool(true));
+        assert_eq!(options["unset"], OptionValue::Null);
+        assert_eq!(options["ceiling"], OptionValue::Float(f64::INFINITY));
+        assert_eq!(
+            options["tags"],
+            OptionValue::Seq(vec![OptionValue::String("a".into()), OptionValue::UInt(2)])
+        );
+        assert_eq!(
+            options["nested"],
+            OptionValue::Map(vec![
+                (OptionValue::String("b".into()), OptionValue::UInt(1)),
+                (OptionValue::String("a".into()), OptionValue::UInt(2)),
+            ])
+        );
+    }
+
+    #[test]
+    fn merge_keys_fill_a_bind_from_an_anchor() {
+        let cfg = SmppConfig::from_yaml(
+            "x-bind: &upstream\n  host: smsc-a.example.net\n  port: 2775\n  system_id: alpha_esme\n  password: changeme\nbinds:\n  - <<: *upstream\n    name: alpha\n  - <<: *upstream\n    name: beta\n    port: 2776\n",
+        )
+        .expect("merge keys load");
+        assert_eq!(cfg.binds[0].host, "smsc-a.example.net");
+        assert_eq!(cfg.binds[0].port, 2775);
+        assert_eq!(cfg.binds[1].name, "beta");
+        assert_eq!(cfg.binds[1].port, 2776);
+        assert_eq!(cfg.binds[1].system_id, "alpha_esme");
+    }
+
     // ── listen() precedence ─────────────────────────────────────────────
 
     #[test]
     fn listen_prefers_nested_server() {
-        let cfg: SmppConfig = serde_yaml::from_str(
+        let cfg: SmppConfig = SmppConfig::from_yaml(
             "server:\n  bind_address: 10.0.0.1\n  port: 5000\nbind_address: 9.9.9.9\nport: 1234\n",
         )
         .unwrap();
@@ -593,11 +831,12 @@ binds:
     #[test]
     fn listen_falls_back_to_flat_then_default() {
         // flat-only (back-compat shape)
-        let flat: SmppConfig = serde_yaml::from_str("bind_address: 8.8.8.8\nport: 4321\n").unwrap();
+        let flat: SmppConfig =
+            SmppConfig::from_yaml("bind_address: 8.8.8.8\nport: 4321\n").unwrap();
         assert_eq!(flat.listen(), ("8.8.8.8".to_string(), 4321));
 
         // nothing set → hard defaults
-        let empty: SmppConfig = serde_yaml::from_str("{}").unwrap();
+        let empty: SmppConfig = SmppConfig::from_yaml("{}").unwrap();
         assert_eq!(empty.listen(), ("0.0.0.0".to_string(), 2775));
     }
 

@@ -132,7 +132,7 @@ fn bench_config(c: &mut Criterion) {
     let mut g = c.benchmark_group("config");
     g.throughput(Throughput::Elements(1));
     g.bench_function("parse_yaml", |b| {
-        b.iter(|| black_box(serde_yaml::from_str::<SmppConfig>(black_box(SAMPLE_YAML)).unwrap()))
+        b.iter(|| black_box(SmppConfig::from_yaml(black_box(SAMPLE_YAML)).unwrap()))
     });
     g.finish();
 }
