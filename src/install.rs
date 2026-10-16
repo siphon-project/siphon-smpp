@@ -174,11 +174,11 @@ mod tests {
         let yaml = "routing:\n  rules:\n    - prefix: \"1555\"\n      chain: [bind:a]\n      options:\n        rate_cap: 10\n        label: north\n        flag: yes\n        unset: ~\n        ratio: 1.50\n        ceiling: .inf\n        tags: [1, two, true]\n        nested: {k: v, n: 2}\n";
         let cfg = SmppConfig::from_yaml(yaml).expect("options load");
         Python::attach(|py| {
-            let module = namespace(cfg)(py).expect("namespace builds");
-            let rules: Vec<Bound<'_, PyDict>> = module
-                .bind(py)
-                .getattr("_config")
-                .and_then(|c| c.get_item("routing"))
+            // Build the dict directly: every namespace() call execs into the
+            // one sys.modules["smpp"], so reading `_config` back off the module
+            // races the other tests that build a namespace.
+            let rules: Vec<Bound<'_, PyDict>> = build_config_dict(py, &cfg)
+                .and_then(|c| c.as_any().get_item("routing"))
                 .and_then(|r| r.get_item("rules"))
                 .and_then(|r| r.extract())
                 .expect("rules list");
