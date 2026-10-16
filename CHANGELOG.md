@@ -13,8 +13,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   deprecated and sits on `unsafe-libyaml`, which is unmaintained
   (RUSTSEC-2024-0449). The shipped configs load to the same values. Breaking
   for Rust callers: `RoutingRule::options` is now a map of the new
-  `config::OptionValue`, `ConfigError::Parse` carries a
-  `Box<serde_saphyr::Error>`, and the minimum Rust version is 1.89 (already
+  `config::OptionValue`, `ConfigError::Parse` carries the new
+  `config::YamlError`, and the minimum Rust version is 1.89 (already
   the floor through `siphon-sip`). New `SmppConfig::from_yaml`.
 - What loads differently: `<<` merge keys are applied; a `~` section
   (`server: ~`, `options: ~`) takes the defaults; quoted numbers, `1_000`
@@ -23,8 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   written as a bare `null` or `~` is now empty instead of the literal text.
   Under `options:`, a number with a leading zero (`017`) reaches the script
   as `17.0`, and a custom tag is dropped.
-- Parse errors no longer quote the offending value. The config has bind
-  passwords expanded into it, and the old messages could log one.
+- Parse errors name the key path and the line and column
+  (`binds[1].port: invalid u16 at line 9, column 11`) but no longer quote
+  the offending value. The config has bind passwords expanded into it, and
+  the old messages could log one.
 
 ## [1.6.0] — 2026-10-09
 

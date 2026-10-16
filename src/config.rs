@@ -343,6 +343,32 @@ fn default_bind_type() -> String {
     "transceiver".into()
 }
 
+/// A YAML document that does not fit [`SmppConfig`].
+#[derive(Debug)]
+pub struct YamlError {
+    /// Where in the document, e.g. `binds[1].port`; `.` for the root.
+    pub key_path: String,
+    // Boxed: the parser's error is large, and every Result that carries
+    // this would otherwise carry its size.
+    pub source: Box<serde_saphyr::Error>,
+}
+
+impl std::fmt::Display for YamlError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.key_path.is_empty() || self.key_path == "." {
+            write!(f, "{}", self.source)
+        } else {
+            write!(f, "{}: {}", self.key_path, self.source)
+        }
+    }
+}
+
+impl std::error::Error for YamlError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
     #[error("read {path}: {source}")]
@@ -351,12 +377,7 @@ pub enum ConfigError {
         source: std::io::Error,
     },
     #[error("parse {path}: {source}")]
-    Parse {
-        path: String,
-        // Boxed: the parser's error is large, and every Result in here
-        // would otherwise carry its size.
-        source: Box<serde_saphyr::Error>,
-    },
+    Parse { path: String, source: YamlError },
     #[error("bind {bind:?} from env: missing SMPP_BIND_{}_{field}", bind.to_uppercase())]
     EnvBindMissing { bind: String, field: &'static str },
     #[error("bind {bind:?} from env: SMPP_BIND_{}_{field} = {value:?} ({source})",
@@ -375,7 +396,10 @@ impl SmppConfig {
     /// Source snippets are left out of parse errors on purpose: the input
     /// has had environment variables expanded into it, so a snippet could
     /// carry a bind password into the logs.
-    pub fn from_yaml(yaml: &str) -> Result<Self, serde_saphyr::Error> {
+    ///
+    /// The error names the key path (`binds[1].port`) and the line and
+    /// column, never the value.
+    pub fn from_yaml(yaml: &str) -> Result<Self, YamlError> {
         let mut options = serde_saphyr::Options::default();
         options.with_snippet = false;
         // Only `true` / `false` are booleans; `yes`, `on`, `n` and friends
@@ -383,7 +407,17 @@ impl SmppConfig {
         options.strict_booleans = true;
         // `.inf` / `.nan` under a rule's `options:` are values, not errors.
         options.non_finite_float_policy = serde_saphyr::NonFiniteFloatPolicy::PassThrough;
-        serde_saphyr::from_str_with_options(yaml, options)
+        let mut key_path = String::new();
+        serde_saphyr::with_deserializer_from_str_with_options(yaml, options, |deserializer| {
+            serde_path_to_error::deserialize(deserializer).map_err(|error| {
+                key_path = error.path().to_string();
+                error.into_inner()
+            })
+        })
+        .map_err(|source| YamlError {
+            key_path,
+            source: Box::new(source),
+        })
     }
 
     pub fn from_file(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
@@ -395,7 +429,7 @@ impl SmppConfig {
         let expanded = expand_env_vars(&raw);
         let mut cfg = Self::from_yaml(&expanded).map_err(|source| ConfigError::Parse {
             path: path.display().to_string(),
-            source: Box::new(source),
+            source,
         })?;
         cfg.binds.extend(binds_from_env()?);
         if !cfg.binds.is_empty() {
@@ -775,6 +809,34 @@ binds:
         assert!(
             !err.to_string().contains("hunter2"),
             "error leaks config text: {err}"
+        );
+    }
+
+    #[test]
+    fn a_parse_error_names_the_key_path_and_the_position() {
+        let err = SmppConfig::from_yaml(
+            "binds:\n  - name: a\n    host: h.example.net\n    port: 2775\n    system_id: x\n    password: p\n  - name: b\n    host: h.example.net\n    port: not-a-port\n    system_id: x\n    password: p\n",
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("binds[1].port"), "no key path: {message}");
+        assert!(message.contains("line 9"), "no position: {message}");
+        assert!(
+            !message.contains("not-a-port"),
+            "quotes the value: {message}"
+        );
+    }
+
+    #[test]
+    fn a_parse_error_in_a_rule_option_names_the_option_key() {
+        let err = SmppConfig::from_yaml(
+            "routing:\n  rules:\n    - prefix: \"1555\"\n      chain: [bind:a]\n      options:\n        k: 1\n        k: 2\n",
+        )
+        .unwrap_err();
+        let message = err.to_string();
+        assert!(
+            message.contains("routing.rules[0].options"),
+            "no key path: {message}"
         );
     }
 
