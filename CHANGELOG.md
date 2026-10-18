@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.1] — 2026-10-18
+
+### Changed
+
+- **`smpp34` 1.5.0 in `Cargo.lock`.** Its client TLS moved from system OpenSSL
+  to `rustls` (ring backend, OS trust store), so building no longer needs
+  OpenSSL headers. No API change here. An outbound bind with `tls` on can now
+  fail a handshake that used to work: only ECDHE key exchange with AEAD ciphers
+  is offered, and the peer certificate must carry a subjectAltName for the
+  address dialled (CN-only, SHA-1 signed and weak-key certificates are
+  refused). TLS 1.2 is still the minimum.
+
 ## [2.0.0] — 2026-10-16
 
 ### Changed
