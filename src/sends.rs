@@ -389,7 +389,7 @@ pub fn submit_via<'py>(
     let state = require_state()?;
     check_short_message("submit_sm", short_message.len(), true)?;
     let tlvs = tlvs_from_py(tlvs)?;
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+    siphon::script::blocking::awaitable(py, async move {
         let target = bind_handle(&state, &bind).await?;
         pace(target.throttle.clone()).await;
         let send = target
@@ -489,7 +489,7 @@ pub fn submit_multi_via<'py>(
             dest_addresses.len()
         )));
     }
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+    siphon::script::blocking::awaitable(py, async move {
         let target = bind_handle(&state, &bind).await?;
         pace(target.throttle.clone()).await;
         // Sequence number 0: send_submit_sm_multi_pdu owns the sequence
@@ -575,7 +575,7 @@ pub fn data_via<'py>(
         short_message,
         tlvs_from_py(tlvs)?,
     )?;
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+    siphon::script::blocking::awaitable(py, async move {
         let target = bind_handle(&state, &bind).await?;
         pace(target.throttle.clone()).await;
         let send = target.smsc.send_data_sm_pdu(pdu);
@@ -616,7 +616,7 @@ pub fn cancel_via<'py>(
     dest_addr_npi: u8,
 ) -> PyResult<Bound<'py, PyAny>> {
     let state = require_state()?;
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+    siphon::script::blocking::awaitable(py, async move {
         let target = bind_handle(&state, &bind).await?;
         let send = target.smsc.send_cancel_sm(
             service_type,
@@ -650,7 +650,7 @@ pub fn query_via<'py>(
     source_addr_npi: u8,
 ) -> PyResult<Bound<'py, PyAny>> {
     let state = require_state()?;
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+    siphon::script::blocking::awaitable(py, async move {
         let target = bind_handle(&state, &bind).await?;
         let send =
             target
@@ -690,7 +690,7 @@ pub fn replace_via<'py>(
     // replace_sm has no optional parameters in 3.4, so there is no
     // message_payload to fall back on — the body has to fit.
     check_short_message("replace_sm", short_message.len(), false)?;
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+    siphon::script::blocking::awaitable(py, async move {
         let target = bind_handle(&state, &bind).await?;
         let send = target.smsc.send_replace_sm(
             message_id,
@@ -763,7 +763,7 @@ pub fn deliver_to<'py>(
     let state = require_state()?;
     check_short_message("deliver_sm", short_message.len(), true)?;
     let tlvs = tlvs_from_py(tlvs)?;
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+    siphon::script::blocking::awaitable(py, async move {
         let (esme, response_timer) = esme_handle(&state, &session_id).await?;
         if !esme.can_receive {
             return Err(PyRuntimeError::new_err(format!(
@@ -856,7 +856,7 @@ pub fn data_to<'py>(
         short_message,
         tlvs_from_py(tlvs)?,
     )?;
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+    siphon::script::blocking::awaitable(py, async move {
         let (esme, response_timer) = esme_handle(&state, &session_id).await?;
         let send = esme.send_data_sm_pdu(pdu);
         let resp =
@@ -894,7 +894,7 @@ pub fn alert_to<'py>(
     ms_availability_status: Option<u8>,
 ) -> PyResult<Bound<'py, PyAny>> {
     let state = require_state()?;
-    pyo3_async_runtimes::tokio::future_into_py(py, async move {
+    siphon::script::blocking::awaitable(py, async move {
         let (esme, _) = esme_handle(&state, &session_id).await?;
         if !esme.can_receive {
             return Err(PyRuntimeError::new_err(format!(

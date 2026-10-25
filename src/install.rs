@@ -18,6 +18,7 @@ use std::ffi::CString;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList, PyModule};
 
+use crate::dispatch::RegisteredHandler;
 use crate::outcome::SmppSendError;
 use crate::pyclasses::{AlertNotification, Bind, BindResult, Pdu, PduReply, Session};
 use crate::sends::{
@@ -59,6 +60,8 @@ pub fn namespace(
         module.add_class::<Bind>()?;
         module.add_class::<BindResult>()?;
         module.add_class::<AlertNotification>()?;
+        // What the decorators store with each registration (see dispatch.rs).
+        module.add_class::<RegisteredHandler>()?;
         module.add_class::<SmppResp>()?;
         module.add_class::<QueryResp>()?;
         // Raised by the send helpers when a request gets no response PDU.
@@ -92,9 +95,8 @@ pub fn namespace(
 ///   1. Spawns the tokio listener on `script.tokio_handle()` so the
 ///      per-worker asyncio loop is live on the call thread (per the
 ///      ScriptHandle contract).
-///   2. On each inbound PDU, looks up matching handlers via
-///      `script.handlers_for("smpp.on_pdu")` filtered by command, then
-///      `script.call_handler(...)` to invoke them.
+///   2. On each inbound PDU, runs the matching handler in one job on
+///      siphon's Python executor (see `dispatch.rs`).
 pub fn task(cfg: SmppConfig) -> impl FnOnce(siphon::script::ScriptHandle) + Send + 'static {
     move |script| {
         crate::runtime::spawn(cfg, script);
