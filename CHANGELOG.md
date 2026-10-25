@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [2.0.2] — 2026-10-25
+
 ### Changed
 
 - **Each SMPP event runs as one job on siphon's Python executor, and tokio
