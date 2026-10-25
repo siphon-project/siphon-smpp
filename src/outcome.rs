@@ -198,33 +198,71 @@ impl SendFailure {
 
     /// Build the [`SmppSendError`] a send helper raises. `target` names
     /// the session (`bind "x"` / `session "y"`), `command` the request.
+    ///
+    /// Lazy: nothing touches the interpreter here, because this runs in the
+    /// send's future on a tokio worker. The exception, attributes and all,
+    /// is built when Python raises it, in the awaitable's completion step on
+    /// the blocking pool.
     pub(crate) fn into_pyerr(self, command: &str, target: &str) -> PyErr {
-        let message = format!("{target} {command}: {}", self.describe());
-        Python::attach(|py| {
-            let error = PyErr::new::<SmppSendError, _>(message);
-            let value = error.value(py);
-            let annotated = (|| -> PyResult<()> {
-                value.setattr("reason", self.reason())?;
-                value.setattr("command", command)?;
-                match self {
-                    SendFailure::Nack(status) => {
-                        value.setattr("command_status", format!("{status:?}"))?;
-                        value.setattr("command_status_code", status as u32)?;
-                    }
-                    _ => {
-                        value.setattr("command_status", py.None())?;
-                        value.setattr("command_status_code", py.None())?;
-                    }
-                }
-                Ok(())
-            })();
-            match annotated {
-                Ok(()) => error,
-                // Could not attach the attributes; raise that instead of an
-                // exception whose `reason` would read as missing.
-                Err(attach_error) => attach_error,
-            }
+        PyErr::new::<SmppSendError, _>(SendErrorValue {
+            message: format!("{target} {command}: {}", self.describe()),
+            reason: self.reason(),
+            command: command.to_string(),
+            status: match self {
+                SendFailure::Nack(status) => Some((format!("{status:?}"), status as u32)),
+                _ => None,
+            },
         })
+    }
+}
+
+/// An [`SmppSendError`] still to be built. Python raises the instance this
+/// converts to as it is, attributes included.
+struct SendErrorValue {
+    message: String,
+    reason: &'static str,
+    command: String,
+    status: Option<(String, u32)>,
+}
+
+impl SendErrorValue {
+    fn instance<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        let value = py
+            .get_type::<SmppSendError>()
+            .call1((self.message.as_str(),))?;
+        value.setattr("reason", self.reason)?;
+        value.setattr("command", self.command.as_str())?;
+        match &self.status {
+            Some((name, code)) => {
+                value.setattr("command_status", name.as_str())?;
+                value.setattr("command_status_code", *code)?;
+            }
+            None => {
+                value.setattr("command_status", py.None())?;
+                value.setattr("command_status_code", py.None())?;
+            }
+        }
+        Ok(value)
+    }
+}
+
+impl<'py> IntoPyObject<'py> for SendErrorValue {
+    type Target = PyAny;
+    type Output = Bound<'py, PyAny>;
+    type Error = std::convert::Infallible;
+
+    fn into_pyobject(self, py: Python<'py>) -> Result<Self::Output, Self::Error> {
+        #[cfg(test)]
+        crate::test_support::record_python_use();
+        match self.instance(py) {
+            Ok(value) => Ok(value),
+            Err(error) => {
+                // Raised with its message alone rather than not at all.
+                tracing::error!(target: "siphon_smpp", error = %error,
+                    "could not set the SmppSendError attributes");
+                Ok(pyo3::types::PyString::new(py, &self.message).into_any())
+            }
+        }
     }
 }
 

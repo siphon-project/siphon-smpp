@@ -49,7 +49,12 @@
 //! routing decisions, ESME credential verification, message
 //! persistence/queueing, throttling *policy*.
 
+// Tests may block freely: `clippy.toml`'s disallowed-methods guards the
+// threads production code runs on, and a test thread is not one of them.
+#![cfg_attr(test, allow(clippy::disallowed_methods))]
+
 pub mod config;
+pub(crate) mod dispatch;
 pub mod install;
 pub(crate) mod metrics;
 pub(crate) mod outcome;
@@ -58,9 +63,13 @@ pub mod runtime;
 pub mod sends;
 #[cfg(test)]
 mod session_tests;
+#[cfg(test)]
+mod test_support;
 pub mod tlv;
 
 pub use config::SmppConfig;
+#[doc(hidden)]
+pub use dispatch::bench_support;
 pub use install::{namespace, task};
 pub use pyclasses::{Pdu, Receipt};
 

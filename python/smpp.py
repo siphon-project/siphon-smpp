@@ -116,6 +116,16 @@ def _registry():
     return _r
 
 
+def _register(kind, filter, fn, key, options):
+    # `_Handler` (attached by Rust) carries what the dispatcher needs on
+    # every event: the callable, its key and whether it is a coroutine
+    # function, worked out once here instead of per PDU.
+    is_async = asyncio.iscoroutinefunction(fn)
+    options = dict(options or {})
+    options["_handler"] = _Handler(fn, is_async, key)  # noqa: F821
+    _registry().register(kind, filter, fn, is_async, options)
+
+
 # ── Decorators ──────────────────────────────────────────────────────────
 
 def on_bind(fn):
@@ -130,8 +140,7 @@ def on_bind(fn):
     @smpp.on_bind handler at all, the default is REJECT — binds are
     closed by default, scripts must explicitly authorise them. The
     `reason` is logged on the reject for operator visibility."""
-    _registry().register("smpp.on_bind", None, fn,
-                         asyncio.iscoroutinefunction(fn), None)
+    _register("smpp.on_bind", None, fn, None, None)
     return fn
 
 
@@ -180,9 +189,7 @@ def on_pdu(command):
     The Rust dispatcher matches on `options.command`.
     """
     def decorator(fn):
-        _registry().register("smpp.on_pdu", None, fn,
-                             asyncio.iscoroutinefunction(fn),
-                             {"command": command})
+        _register("smpp.on_pdu", None, fn, command, {"command": command})
         return fn
     return decorator
 
@@ -196,9 +203,7 @@ def on_session(event):
     system_id → session_id map for MT routing, emit metrics, or flush
     queues. The return value is ignored."""
     def decorator(fn):
-        _registry().register("smpp.on_session", event, fn,
-                             asyncio.iscoroutinefunction(fn),
-                             {"event": event})
+        _register("smpp.on_session", event, fn, event, {"event": event})
         return fn
     return decorator
 

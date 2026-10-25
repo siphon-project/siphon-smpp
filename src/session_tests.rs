@@ -255,10 +255,17 @@ impl SmppClientListener for Binds {
 struct Esmes {
     esmes: Mutex<Vec<EsmeSession>>,
     response_timer: Duration,
+    /// Set when the server could not listen on the port it was given.
+    listen_failed: std::sync::atomic::AtomicBool,
 }
 
 #[async_trait]
 impl SmppServerListener for Esmes {
+    async fn on_listen_failed(&self, _error: &str) {
+        self.listen_failed
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     async fn on_bind_transceiver(
         &self,
         request: bind_transceiver,
@@ -347,29 +354,45 @@ struct Inbound {
 }
 
 async fn inbound(answer: Answer, response_timer: Duration) -> Inbound {
-    // SmppServer takes a port number, not a socket: find a free one.
-    let port = {
-        let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
-            .await
-            .expect("probe");
-        probe.local_addr().expect("addr").port()
+    // SmppServer takes a port number, not a socket, so a free one is found
+    // and released first. Another test (or the child process one of them
+    // runs) can take it in between; the server then reports that it could
+    // not listen, and a fresh port is tried. Once it listens, the port is
+    // ours.
+    let mut attempts = 0;
+    let (registry, server, port) = loop {
+        attempts += 1;
+        let port = {
+            let probe = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .expect("probe");
+            probe.local_addr().expect("addr").port()
+        };
+        let registry = Arc::new(Esmes {
+            esmes: Mutex::new(Vec::new()),
+            response_timer,
+            listen_failed: std::sync::atomic::AtomicBool::new(false),
+        });
+        let listener: Arc<dyn SmppServerListener + Send + Sync> = registry.clone();
+        let mut server = SmppServer::new_with_default_timers(
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+            port,
+            listener,
+            5_000,
+            600_000,
+            600_000,
+            response_timer.as_millis() as u64,
+            1_500,
+        );
+        server.start().await;
+        if !registry
+            .listen_failed
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            break (registry, server, port);
+        }
+        assert!(attempts < 20, "no free port to listen on");
     };
-    let registry = Arc::new(Esmes {
-        esmes: Mutex::new(Vec::new()),
-        response_timer,
-    });
-    let listener: Arc<dyn SmppServerListener + Send + Sync> = registry.clone();
-    let mut server = SmppServer::new_with_default_timers(
-        IpAddr::V4(Ipv4Addr::LOCALHOST),
-        port,
-        listener,
-        5_000,
-        600_000,
-        600_000,
-        response_timer.as_millis() as u64,
-        1_500,
-    );
-    server.start().await;
     let sent = fake_esme(port, answer).await;
     let esme = wait_for(|| async {
         registry
@@ -849,4 +872,157 @@ async fn a_rejected_data_sm_to_an_esme_reports_its_status() {
         seen(SmppResp::from_reply(&resp)),
         rejected("ESME_RX_T_APPN", 0x0000_0064)
     );
+}
+
+// ── Sends from a script, with the garbage collector stopping the world ──
+
+/// Every send helper awaited from an `async def` handler, on several sessions
+/// at once, while another thread keeps forcing full collections. None of it
+/// may touch the interpreter on a tokio worker: a worker that does parks
+/// through each stop-the-world, and every session it polls parks with it.
+#[test]
+fn sends_never_touch_python_on_a_tokio_worker_while_gc_stops_the_world() {
+    use crate::dispatch::{tests::deliver, tests::handlers_from, tests::session};
+    use crate::test_support::{
+        collect_garbage_until, in_child, in_task, python_uses_on_tokio_workers, runtime,
+    };
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    if !in_child(
+        concat!(
+            module_path!(),
+            "::sends_never_touch_python_on_a_tokio_worker_while_gc_stops_the_world"
+        ),
+        Duration::from_secs(180),
+    ) {
+        return;
+    }
+    runtime();
+    let accepting_answer = Answer::Respond {
+        command_id: SUBMIT_SM_RESP,
+        status: 0,
+        body: b"m-1\0".to_vec(),
+    };
+    let deliver_answer = Answer::Respond {
+        command_id: DELIVER_SM_RESP,
+        status: 0,
+        body: vec![0],
+    };
+    // ESME_RINVCMDLEN (§5.1.3) in a generic_nack: the helper raises.
+    let (accepting, nacking, esme) = in_task(async move {
+        (
+            outbound(accepting_answer, LONG_TIMER).await,
+            outbound(Answer::Nack(0x0000_0002), LONG_TIMER).await,
+            inbound(deliver_answer, LONG_TIMER).await,
+        )
+    });
+    let session_id = esme.esme.session_id.clone();
+
+    let handlers = handlers_from(
+        r#"
+@smpp.on_pdu("deliver_sm")
+async def drive(pdu, session):
+    session_id = pdu.body.decode()
+    resp = await smpp.submit_via(bind="accepting", source_addr="5550100",
+                                 destination_addr="5550199", short_message=b"mo")
+    assert resp and resp.message_id == "m-1", resp
+    try:
+        await smpp.submit_via(bind="nacking", source_addr="5550100",
+                              destination_addr="5550199", short_message=b"mo")
+        raise AssertionError("a generic_nack must raise")
+    except smpp.SmppSendError as error:
+        assert error.reason == "nack", error.reason
+        assert error.command_status == "ESME_RINVCMDLEN", error.command_status
+    resp = await smpp.deliver_to(session_id=session_id, source_addr="5550199",
+                                 destination_addr="5550100", short_message=b"mt")
+    assert resp, resp
+    try:
+        await smpp.submit_via(bind="absent", source_addr="5550100",
+                              destination_addr="5550199", short_message=b"mo")
+        raise AssertionError("an unbound bind must raise")
+    except KeyError:
+        pass
+    return pdu.reply(message_id="done")
+"#,
+    );
+
+    let renamed = |name: &str, from: &Outbound| BindSession {
+        name: name.to_string(),
+        smsc: from.smsc.clone(),
+        throttle: None,
+        response_timer: LONG_TIMER,
+    };
+    let state = Arc::new(crate::runtime::State {
+        binds: Mutex::new(vec![
+            renamed("accepting", &accepting),
+            renamed("nacking", &nacking),
+        ]),
+        esmes: Mutex::new(vec![EsmeSession {
+            esme: esme.esme.clone(),
+            throttle: None,
+            response_timer: LONG_TIMER,
+        }]),
+        inbound_max_mps: 0,
+        inbound_throttle_action: crate::config::ThrottleAction::Pace,
+        inbound_response_timer: LONG_TIMER,
+        listen_failure: std::sync::OnceLock::new(),
+        handlers: Arc::clone(&handlers),
+    });
+    assert!(
+        crate::runtime::STATE.set(state).is_ok(),
+        "state installed once"
+    );
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let collector = collect_garbage_until(Arc::clone(&stop));
+    let before = python_uses_on_tokio_workers();
+
+    const DRIVERS: usize = 4;
+    const ROUNDS: usize = 20;
+    let finished = in_task(async move {
+        let mut tasks = tokio::task::JoinSet::new();
+        for driver in 0..DRIVERS {
+            let handlers = Arc::clone(&handlers);
+            let session_id = session_id.clone();
+            tasks.spawn(async move {
+                let mut done = 0;
+                for _ in 0..ROUNDS {
+                    let reply = crate::dispatch::pdu(
+                        &handlers,
+                        "deliver_sm",
+                        deliver(&session_id),
+                        session(&format!("driver-{driver}")),
+                    )
+                    .await;
+                    match reply {
+                        Some(Ok(reply)) if reply.message_id.as_deref() == Some("done") => done += 1,
+                        other => panic!("a round failed: {other:?}"),
+                    }
+                }
+                done
+            });
+        }
+        tokio::time::timeout(Duration::from_secs(90), async move {
+            let mut done = 0;
+            while let Some(result) = tasks.join_next().await {
+                done += result.expect("driver task");
+            }
+            done
+        })
+        .await
+    });
+    stop.store(true, Ordering::SeqCst);
+    let collections = collector
+        .join()
+        .expect("collector thread")
+        .expect("collections ran");
+    let touched = python_uses_on_tokio_workers() - before;
+
+    assert!(collections > 0, "the collector never ran");
+    assert_eq!(
+        finished.expect("sends did not finish within the deadline"),
+        DRIVERS * ROUNDS
+    );
+    assert_eq!(touched, 0, "a send touched Python on a tokio worker");
+    drop((accepting, nacking, esme));
 }

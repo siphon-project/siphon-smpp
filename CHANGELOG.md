@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Changed
+
+- **Each SMPP event runs as one job on siphon's Python executor, and tokio
+  workers no longer attach to Python.** Looking up the handler, building the
+  `Pdu` / `Session` / `Bind` objects, calling the handler and reading its
+  reply back used to be five separate attaches, most of them on the tokio
+  worker that received the PDU. Under free-threaded CPython a worker that
+  attaches during a garbage collection parks until it ends, and every session
+  it was polling stalls with it. Now the listener only awaits the job. An
+  `async def` handler is started in that job and handed to siphon's asyncio
+  pool; no executor worker waits for it (one used to be held for the whole
+  wait), and it is still cancelled after the pool's coroutine timeout.
+  `@smpp.on_session` handlers still run in registration order,
+  each finishing before the next. Handlers have to be registered through the
+  `smpp` decorators: the decorator now records the command or event and
+  whether the handler is a coroutine once, so matching an event is a string
+  compare in Rust.
+- **Send helpers no longer touch the interpreter on a tokio worker.** The
+  nine `*_via` / `*_to` helpers hand back their awaitable through siphon's
+  `script::blocking::awaitable`, and `SmppSendError` (with its `reason`,
+  `command` and `command_status` attributes) is built when Python raises it,
+  in the completion step on the blocking pool. Before, every failed send
+  attached on the worker that ran it to build the exception.
+- **Needs `siphon-sip` 1.15.4** (`script::blocking::awaitable`). `Cargo.lock`
+  pins it, with the newer dependencies it brings.
+
+### Security
+
+- `Cargo.lock` takes tokio 1.53.3 (RUSTSEC-2026-0386), rustls-webpki 0.103.16
+  (RUSTSEC-2026-0382) and webpki-roots 1.0.11 (RUSTSEC-2026-0381).
+
 ## [2.0.1] — 2026-10-18
 
 ### Changed
