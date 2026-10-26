@@ -16,8 +16,8 @@ use super::bench_support::ScriptHandlers;
 use super::*;
 use crate::pyclasses::SourceKind;
 use crate::test_support::{
-    collect_garbage_until, in_task, python_uses_on_tokio_workers, runtime, serial,
-    COROUTINE_TIMEOUT, EXECUTOR_THREADS,
+    collect_garbage_until, free_threaded_or_skip, in_task, python_uses_on_tokio_workers, runtime,
+    serial, COROUTINE_TIMEOUT, EXECUTOR_THREADS,
 };
 use crate::SmppConfig;
 
@@ -450,6 +450,9 @@ async def on_deliver(pdu, session):
 
 #[test]
 fn events_on_several_binds_complete_while_gc_stops_the_world() {
+    if !free_threaded_or_skip("events_on_several_binds_complete_while_gc_stops_the_world") {
+        return;
+    }
     let _serial = serial();
     let handlers = handlers_from(
         r#"

@@ -22,9 +22,20 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
+      # Free-threaded CPython, the interpreter siphon embeds: the
+      # garbage-collector stop-the-world tests only mean something there.
+      # SIPHON_SMPP_REQUIRE_FREE_THREADED turns their GIL-build skip into a
+      # failure, so this job cannot go green without running them.
       - uses: actions/setup-python@v7
+        id: python
         with:
-          python-version: "3.13"
+          python-version: "3.14t"
+
+      - name: Use the free-threaded interpreter
+        run: |
+          echo "PYO3_PYTHON=${{ steps.python.outputs.python-path }}" >> "$GITHUB_ENV"
+          echo "SIPHON_SMPP_REQUIRE_FREE_THREADED=1" >> "$GITHUB_ENV"
+          "${{ steps.python.outputs.python-path }}" -c 'import sys, sysconfig; print(sys.version); assert sysconfig.get_config_var("Py_GIL_DISABLED") == 1'
 
       - uses: dtolnay/rust-toolchain@stable
         with:

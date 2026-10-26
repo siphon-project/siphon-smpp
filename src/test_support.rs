@@ -125,6 +125,53 @@ pub(crate) fn collect_garbage_until(
     })
 }
 
+/// Set (to anything) where the suite must run on a free-threaded
+/// interpreter, as CI does: a GIL build then fails the stop-the-world tests
+/// instead of skipping them.
+const REQUIRE_FREE_THREADED: &str = "SIPHON_SMPP_REQUIRE_FREE_THREADED";
+
+/// Whether the linked interpreter is free-threaded with the GIL off, which
+/// is the only place a garbage collection stops the world.
+fn free_threaded() -> PyResult<bool> {
+    Python::initialize();
+    Python::attach(|python| {
+        let built_without_gil = python
+            .import("sysconfig")?
+            .call_method1("get_config_var", ("Py_GIL_DISABLED",))?
+            .extract::<Option<i64>>()?
+            == Some(1);
+        let sys = python.import("sys")?;
+        // A free-threaded build can still run with the GIL re-enabled
+        // (PYTHON_GIL=1, or an extension that is not marked safe).
+        let gil_enabled = if sys.hasattr("_is_gil_enabled")? {
+            sys.call_method0("_is_gil_enabled")?.extract::<bool>()?
+        } else {
+            true
+        };
+        Ok(built_without_gil && !gil_enabled)
+    })
+}
+
+/// Gate for a test whose whole point is the free-threaded stop-the-world.
+/// Returns `true` when it can run. On a GIL interpreter it says so on the
+/// real stderr (past the harness's capture, so it shows in every run) and
+/// returns `false`: the test must then return without asserting anything,
+/// because passing there would claim a deadlock check that never happened.
+/// With `SIPHON_SMPP_REQUIRE_FREE_THREADED` set it fails instead.
+pub(crate) fn free_threaded_or_skip(test: &str) -> bool {
+    if free_threaded().expect("the interpreter can be inspected") {
+        return true;
+    }
+    assert!(
+        std::env::var_os(REQUIRE_FREE_THREADED).is_none(),
+        "{test} needs a free-threaded interpreter with the GIL disabled \
+         ({REQUIRE_FREE_THREADED} is set)"
+    );
+    use std::io::Write;
+    let _ = writeln!(std::io::stderr(), "SKIP (not free-threaded): {test}");
+    false
+}
+
 const CHILD_MARKER: &str = "SIPHON_SMPP_TEST_CHILD";
 
 /// Run the calling test in a child copy of the test binary, killed once it

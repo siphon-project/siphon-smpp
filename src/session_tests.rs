@@ -884,10 +884,15 @@ async fn a_rejected_data_sm_to_an_esme_reports_its_status() {
 fn sends_never_touch_python_on_a_tokio_worker_while_gc_stops_the_world() {
     use crate::dispatch::{tests::deliver, tests::handlers_from, tests::session};
     use crate::test_support::{
-        collect_garbage_until, in_child, in_task, python_uses_on_tokio_workers, runtime,
+        collect_garbage_until, free_threaded_or_skip, in_child, in_task,
+        python_uses_on_tokio_workers, runtime,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
 
+    if !free_threaded_or_skip("sends_never_touch_python_on_a_tokio_worker_while_gc_stops_the_world")
+    {
+        return;
+    }
     if !in_child(
         concat!(
             module_path!(),
